@@ -1,0 +1,3738 @@
+"""AI 测试用例生成器 (整洁重构版)
+
+主要功能:
+- 单条/批量需求用例生成
+- 背景知识文档支持 (docx/txt/md)
+- CSV 导出与结果分析
+"""
+
+import re
+import logging
+from io import BytesIO
+from typing import Dict, Any, List, Optional
+import time
+import pandas as pd
+import streamlit as st
+
+from helper_functions import fetch_feishu_document
+from app_handlers import (
+    handle_single_requirement,
+    handle_batch_processing,
+    handle_help_page
+)
+from file_processors import (
+    _process_excel_file,
+    _process_word_file,
+    _process_pdf_file,
+    _process_text_file
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# === 应用基础配置 ===
+class AppConfig:
+    """应用程序配置"""
+    # 基本参数
+    DEFAULT_HEADERS = ["测试名称", "需求编号", "需求描述", "测试描述", "前置条件", "测试步骤", "预期结果", "需求追溯"]
+    DEFAULT_BASE_URL = "http://model.mify.ai.srv"  # 内部服务优先
+    MAX_RETRY_ATTEMPTS = 3
+    MIN_PARAGRAPH_LENGTH = 10
+    API_KEY = "sk-HXFiS9bEeg95uypM96B6kJfKaxe3ze52FUeQEriGGaGIIefS"  # 固定硬编码
+
+    # 模型配置
+    MODEL_MAP = {
+        "MiMo-7B-RL": "MiMo-7B-RL",
+        "Qwen-235B-A22B": "Qwen-235B-A22B", 
+        "deepseek-v3.1": "deepseek-v3.1",
+        "Qwen2.5-VL-72B-Instruct-AWQ": "Qwen2.5-VL-72B-Instruct-AWQ"
+    }
+    
+    ALLOWED_MODELS = list(MODEL_MAP.keys())
+    
+    MODEL_PRICING_TAG = {
+        "MiMo-7B-RL": "(免费)",
+        "Qwen-235B-A22B": "(计费)",
+        "deepseek-v3.1": "(计费)",
+        "Qwen2.5-VL-72B-Instruct-AWQ": "(计费)"
+    }
+    
+    # 服务路由配置
+    ROUTE_HEADER_VALUE = "xiaomi"  # 默认用于 MiMo
+    MODEL_PROVIDER_HEADER = {
+        "MiMo-7B-RL": "xiaomi",
+        "Qwen-235B-A22B": "openai_api_compatible",
+        "deepseek-v3.1": "openai_api_compatible",
+        "Qwen2.5-VL-72B-Instruct-AWQ": "openai_api_compatible"
+    }
+
+class FeishuConfig:
+    """飞书API配置"""
+    BASE_API = os.environ.get("FEISHU_OPEN_BASE", "https://open.feishu.cn")
+    TOKEN_ENDPOINT = f"{BASE_API}/open-apis/auth/v3/tenant_access_token/internal"
+    USER_TOKEN_ENDPOINT = f"{BASE_API}/open-apis/authen/v1/access_token"
+    OAUTH_AUTHORIZE_URL = f"{BASE_API}/open-apis/authen/v1/authorize"
+    OAUTH_TOKEN_URL = f"{BASE_API}/open-apis/authen/v1/refresh_access_token"
+    DOC_ENDPOINT_TMPL = f"{BASE_API}/open-apis/docx/v1/documents/{{doc_id}}"
+    BLOCKS_ENDPOINT_TMPL = f"{BASE_API}/open-apis/docx/v1/documents/{{doc_id}}/blocks/{{block_id}}?page_size={{page_size}}&page_token={{page_token}}"
+
+# 飞书文档块类型抽取策略
+FEISHU_INLINE_KEY_CANDIDATES = ["elements", "runs", "inlines", "text_run"]
+
+def handle_errors(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.exception(e)
+            msg = str(e)
+            low = msg.lower()
+            if ('401' in msg) or ('authentication' in low) or ('invalid' in low and 'key' in low):
+                st.error("认证失败：请确认后端已为当前硬编码密钥授权。")
+            else:
+                st.error(f"操作失败: {msg}")
+            return None
+    return wrapper
+
+# === API错误处理 ===
+class APIError(Exception):
+    """API调用相关错误的基类"""
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+class AuthenticationError(APIError):
+    """认证相关错误"""
+    pass
+
+class NetworkError(APIError):
+    """网络请求错误"""
+    pass
+
+class ResponseError(APIError):
+    """响应解析错误"""
+    pass
+
+def handle_api_errors(func):
+    """API错误处理装饰器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except requests.exceptions.RequestException as e:
+            raise NetworkError(f"网络请求失败: {e}")
+        except (ValueError, json.JSONDecodeError) as e:
+            raise ResponseError(f"响应格式错误: {e}")
+        except Exception as e:
+            if isinstance(e, APIError):
+                raise
+            raise APIError(f"API调用异常: {e}")
+    return wrapper
+
+# === 飞书API辅助类 ===
+class FeishuAPI:
+    """飞书API操作封装"""
+    def __init__(self, app_id: str, app_secret: str, debug: bool = False):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.debug = debug
+    
+    @handle_api_errors
+    def get_user_access_token(self, code: str) -> str:
+        """通过授权码获取飞书用户访问令牌"""
+        payload = {
+            "grant_type": "authorization_code",
+            "client_id": self.app_id,
+            "client_secret": self.app_secret,
+            "code": code
+        }
+        
+        if self.debug:
+            logger.debug(f"Requesting user token with code: {code[:10]}...")
+            
+        resp = requests.post(
+            FeishuConfig.OAUTH_TOKEN_URL,
+            json=payload,
+            timeout=10
+        )
+        
+        if self.debug:
+            logger.debug(f"User token HTTP status: {resp.status_code}")
+            
+        if resp.status_code != 200:
+            raise AuthenticationError(
+                f"获取用户令牌失败: {resp.text[:300]}", 
+                resp.status_code
+            )
+            
+        data = resp.json()
+        
+        if self.debug:
+            logger.debug(f"User token response: {json.dumps(data, ensure_ascii=False)[:400]}")
+            
+        if data.get("code") != 0:
+            raise AuthenticationError(
+                f"获取用户令牌失败: code={data.get('code')} msg={data.get('msg')}"
+            )
+            
+        return data["data"]["access_token"]
+    @handle_api_errors
+    def get_tenant_access_token(self, retries: int = 3, base_delay: float = 0.8) -> str:
+        """获取飞书租户访问令牌，支持指数退避重试"""
+        payload = {
+            "app_id": self.app_id,
+            "app_secret": self.app_secret
+        }
+        
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(1, retries + 1):
+            if self.debug:
+                logger.debug(f"Token request attempt {attempt}/{retries}")
+                
+            try:
+                resp = requests.post(
+                    FeishuConfig.TOKEN_ENDPOINT,
+                    json=payload,
+                    timeout=10
+                )
+                
+                if self.debug:
+                    logger.debug(f"Token response status: {resp.status_code}")
+                
+                if resp.status_code == 500:
+                    snippet = resp.text[:300]
+                    logger.warning(f"Server 500 error. Response: {snippet}")
+                    last_error = APIError("服务器内部错误", 500)
+                    
+                elif resp.status_code != 200:
+                    last_error = APIError(
+                        f"获取令牌失败: {resp.text[:300]}", 
+                        resp.status_code
+                    )
+                    
+                else:
+                    data = resp.json()
+                    
+                    if self.debug:
+                        logger.debug(f"Token response: {json.dumps(data, ensure_ascii=False)[:400]}")
+                    
+                    if data.get("code") == 0:
+                        return data["tenant_access_token"]
+                    
+                    last_error = APIError(
+                        f"获取令牌失败: code={data.get('code')} msg={data.get('msg')}"
+                    )
+                    
+            except requests.RequestException as e:
+                last_error = NetworkError(f"网络请求失败: {e}")
+                if self.debug:
+                    logger.debug(f"Network error: {e}")
+            
+            # 指数退避重试
+            if attempt < retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                if self.debug:
+                    logger.debug(f"Retrying in {delay:.2f}s")
+                time.sleep(delay)
+                
+        raise last_error or APIError("获取令牌失败(未知错误)")
+
+    @handle_api_errors
+    def api_get(self, url: str, token: str) -> Dict:
+        """通用飞书API GET请求方法"""
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        if self.debug:
+            logger.debug(f"GET {url}")
+            
+        resp = requests.get(url, headers=headers, timeout=10)
+        
+        if self.debug:
+            logger.debug(f"Response status: {resp.status_code}")
+            
+        if resp.status_code != 200:
+            raise APIError(
+                f"请求失败: {resp.text[:300]}", 
+                resp.status_code
+            )
+            
+        data = resp.json()
+        
+        if self.debug:
+            logger.debug(f"Response data: {json.dumps(data, ensure_ascii=False)[:400]}")
+            
+        if data.get("code") not in (0, None):
+            raise APIError(
+                f"请求失败: code={data.get('code')} msg={data.get('msg')}"
+            )
+            
+        return data
+
+    @handle_api_errors
+    def fetch_document_blocks(self, doc_id: str, block_id: str, 
+                            token: str, depth: int = 0, max_depth: int = 8) -> List[Dict]:
+        """递归获取飞书文档块内容
+        
+        Args:
+            doc_id: 文档ID
+            block_id: 当前块ID
+            token: 访问令牌
+            depth: 当前递归深度
+            max_depth: 最大递归深度
+            
+        Returns:
+            文档块列表
+        """
+        # 防止过深递归
+        if depth > max_depth:
+            logger.warning(f"达到最大递归深度 {max_depth}")
+            return []
+            
+        results: List[Dict] = []
+        
+        # 构建API请求URL
+        url = FeishuConfig.BLOCKS_ENDPOINT_TMPL.format(
+            doc_id=doc_id,
+            block_id=block_id,
+            page_size=200,
+            page_token=""
+        )
+        
+        # 获取块数据
+        data = self.api_get(url, token)
+        block_data = data.get("data", {}).get("block")
+        
+        if not block_data:
+            return results
+            
+        results.append(block_data)
+        
+        # 处理子块
+        children = block_data.get("children", [])
+        for child_id in children:
+            if not child_id:
+                continue
+                
+            try:
+                child_blocks = self.fetch_document_blocks(
+                    doc_id=doc_id,
+                    block_id=child_id,
+                    token=token,
+                    depth=depth + 1,
+                    max_depth=max_depth
+                )
+                results.extend(child_blocks)
+            except Exception as e:
+                logger.warning(f"获取子块 {child_id} 失败: {e}")
+                
+        return results
+
+    def extract_block_text(self, block: Dict) -> str:
+        """从文档块中提取文本内容
+        
+        支持的块类型:
+        - 1: 页面块（根块）
+        - 2: 文本块
+        - 其他: 通用处理
+        
+        Args:
+            block: 文档块数据
+            
+        Returns:
+            提取的文本内容
+        """
+        text_parts: List[str] = []
+        block_type = block.get("block_type")
+        
+        # 页面块处理
+        if block_type == 1:
+            text_parts.extend(
+                self._extract_elements_text(
+                    block.get("page", {}).get("elements", [])
+                )
+            )
+            
+        # 文本块处理
+        elif block_type == 2:
+            text_parts.extend(
+                self._extract_elements_text(
+                    block.get("text", {}).get("elements", [])
+                )
+            )
+            
+        # 其他块类型通用处理
+        else:
+            block_content = block.get("block") or {}
+            text_parts.extend(
+                self._extract_nested_text(block_content)
+            )
+            
+        return " ".join(text_parts).strip()
+    
+    def _extract_elements_text(self, elements: List[Dict]) -> List[str]:
+        """从元素列表中提取文本
+        
+        Args:
+            elements: 元素列表
+            
+        Returns:
+            文本片段列表
+        """
+        texts: List[str] = []
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+                
+            text_run = elem.get("text_run", {})
+            content = text_run.get("content", "")
+            if content:
+                texts.append(
+                    content.replace("\n", " ").strip()
+                )
+        return texts
+        
+    def _extract_nested_text(self, data: Dict) -> List[str]:
+        """递归提取嵌套数据中的文本
+        
+        Args:
+            data: 嵌套的数据结构
+            
+        Returns:
+            文本片段列表
+        """
+        texts: List[str] = []
+        
+        def _iter_dict(d: Dict) -> None:
+            for key, value in d.items():
+                if key == "text_run" and isinstance(value, dict):
+                    content = value.get("content")
+                    if content:
+                        texts.append(
+                            content.replace("\n", " ").strip()
+                        )
+                elif isinstance(value, dict):
+                    _iter_dict(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            _iter_dict(item)
+                            
+        _iter_dict(data)
+        return texts
+
+    def blocks_to_markdown(self, blocks: List[Dict]) -> str:
+        """将飞书文档块转换为Markdown格式
+        
+        Args:
+            blocks: 文档块列表
+            
+        Returns:
+            Markdown格式的文档内容
+        """
+        lines: List[str] = []
+        
+        for block in blocks:
+            # 提取文本
+            text = self.extract_block_text(block)
+            if not text:
+                continue
+                
+            # 根据块类型格式化
+            block_type = str(block.get("block_type", "")).lower()
+            
+            # 标题块处理
+            if block_type.startswith("heading") or block_type == "3":
+                level = block_type[-1] if block_type[-1].isdigit() else "2"
+                lines.append(f"{'#' * int(level)} {text}")
+                
+            # 列表块处理
+            elif block_type in ("bullet", "ordered", "list", "4", "5", "6"):
+                lines.append(f"- {text}")
+                
+            # 普通文本块
+            else:
+                lines.append(text)
+                
+        # 清理连续空行
+        return self._clean_empty_lines(lines)
+        
+    def _clean_empty_lines(self, lines: List[str]) -> str:
+        """清理文本中的连续空行
+        
+        Args:
+            lines: 文本行列表
+            
+        Returns:
+            清理后的文本
+        """
+        cleaned: List[str] = []
+        prev_blank = False
+        
+        for line in lines:
+            is_blank = not line.strip()
+            if is_blank and prev_blank:
+                continue
+            cleaned.append(line)
+            prev_blank = is_blank
+            
+        return "\n".join(cleaned)
+        
+    def fetch_document(self, url_or_id: str) -> str:
+        """获取并处理飞书文档内容
+        
+        Args:
+            url_or_id: 文档URL或ID
+            
+        Returns:
+            Markdown格式的文档内容
+        """
+        try:
+            # 提取文档ID
+            doc_id = self._extract_document_id(url_or_id)
+            if not doc_id:
+                raise ValueError("无法从URL提取文档ID")
+                
+            # 获取访问令牌
+            token = self.get_tenant_access_token()
+                
+            # 获取文档块
+            blocks = self.fetch_document_blocks(
+                doc_id=doc_id,
+                block_id=doc_id,
+                token=token,
+                depth=0,
+                max_depth=6
+            )
+                
+            if self.debug:
+                logger.debug(f"获取到 {len(blocks)} 个文档块")
+                if blocks:
+                    logger.debug(
+                        f"第一个块示例: {json.dumps(blocks[0], ensure_ascii=False)[:200]}..."
+                    )
+                
+            # 转换为Markdown
+            markdown = self.blocks_to_markdown(blocks)
+                
+            if self.debug:
+                logger.debug(f"生成Markdown长度: {len(markdown)}")
+                logger.debug(f"Markdown预览: {markdown[:200]}...")
+                
+            return markdown
+            
+        except Exception as e:
+            logger.exception("处理飞书文档失败")
+            return f"【飞书API错误】{str(e)}"
+            
+    def _extract_document_id(self, url_or_id: str) -> Optional[str]:
+        """从URL或ID字符串中提取文档ID
+        
+        Args:
+            url_or_id: URL或ID字符串
+            
+        Returns:
+            文档ID，如果无法提取则返回None
+        """
+        doc_input = url_or_id.strip()
+        match = re.search(r"/(?:docx|wiki|docs)/([A-Za-z0-9]+)", doc_input)
+        
+        if match:
+            return match.group(1)
+            
+        # 如果不是URL格式，假定整个输入就是ID
+        if re.match(r"^[A-Za-z0-9]+$", doc_input):
+            return doc_input
+            
+        return None
+
+from feishu_client import FeishuClient
+from url_utils import UrlFetcher
+
+def create_feishu_client() -> FeishuClient:
+    """创建飞书客户端实例"""
+    app_id = st.session_state.get("feishu_app_id", "cli_a85ffa34d3fad00c")
+    app_secret = st.session_state.get("feishu_app_secret", "MxD6ukGa9ZMJeGl5KicVSgNQLhnE1tcN")
+    debug = st.session_state.get("debug_mode", False)
+    return FeishuClient(app_id, app_secret, debug)
+
+def fetch_background_content(url: str, timeout: int = 10, max_chars: int = 12000) -> str:
+    """获取背景文档内容
+    
+    支持:
+    - 飞书文档 (API访问)
+    - 普通网页 (HTML清理)
+    
+    Args:
+        url: 文档URL
+        timeout: 请求超时时间
+        max_chars: 最大字符数
+    
+    Returns:
+        文档内容
+    """
+    try:
+        # 处理飞书文档
+        if 'feishu.cn' in url or 'larksuite' in url:
+            if re.search(r"/(?:docx|wiki|docs)/[A-Za-z0-9]+", url):
+                try:
+                    client = create_feishu_client()
+                    content = client.fetch_document(url)
+                    if content and not content.startswith("【飞书API错误】"):
+                        if len(content) > max_chars:
+                            content = content[:max_chars] + "...【截断】"
+                        return content
+                except Exception as e:
+                    if st.session_state.get("debug_mode"):
+                        logger.debug(f"飞书API失败，回退网页抓取: {e}")
+                    st.warning(f"飞书API访问失败: {str(e)}，尝试网页抓取")
+                    
+        # 普通网页处理
+        fetcher = UrlFetcher()
+        return fetcher.fetch_content(url, timeout, max_chars)
+        
+    except Exception as e:
+        logger.exception("获取背景内容失败")
+        return f"【异常: {e.__class__.__name__}】{url}"
+
+@handle_errors
+def read_word(file) -> str:
+    doc = Document(file)
+    paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    content = "\n".join(paras)
+    if not content.strip():
+        raise ValueError("Word 文档为空")
+    return content
+
+@handle_errors
+def read_excel(uploaded_file) -> Dict[str, pd.DataFrame]:
+    xl = pd.ExcelFile(uploaded_file)
+    sheets = {}
+    for sheet in xl.sheet_names:
+        df = xl.parse(sheet)
+        if df.empty:
+            continue
+        sheets[sheet] = df
+    if not sheets:
+        raise ValueError("Excel 没有有效工作表")
+    return sheets
+
+def build_prompt(requirement: str, headers: List[str], pos_n: int, neg_n: int, edge_n: int, req_id: str = "", background_knowledge: Optional[str] = None) -> str:
+    if not requirement.strip():
+        raise ValueError("需求不能为空")
+    cols_line = ",".join(headers)
+    total_cases = pos_n + neg_n + edge_n
+    background_section = ""
+    if background_knowledge and background_knowledge.strip():
+        background_section = f"""
+请参考以下背景知识来生成用例：
+---
+{background_knowledge.strip()}
+---
+"""
+    guidance = f"""
+{background_section}
+你是一名具备电力电子与车载系统经验的高级测试工程师，熟悉 OBC/CCU/BMS/EVCC、CAN/CAN-FD、充电流程与功率约束。
+请基于下列需求生成 {total_cases} 条高质量、可执行的测试用例（CSV 格式，第一行为表头）：
+{cols_line}
+
+分配：正向 {pos_n} 条，异常 {neg_n} 条，边界 {edge_n} 条。
+
+规则：
+- 仅输出 CSV 内容，不要附加解释或代码块。
+- 测试步骤用分号（；）分隔并放在同一单元格内。
+- 前置条件为空填写 "无"。
+- 输入数据要具体（例如：VIN=1234, CAN_ID=0x18FF50E5, 电压=400V, 电流=50A）。
+- 预期结果应包含可观测的阈值或时间条件（例如：电流稳定在 50A ±5% 持续 10s）。
+- 需求编号列填写: {req_id if req_id else "REQ-001"}
+- 需求描述列简要概括需求内容（不超过50字）
+- 需求追溯列填写该测试用例验证的具体需求点
+
+电力电子注意事项：明确采样时序、SOC/温度/电力边界、故障注入（丢帧/延迟/短路）、EVCC通信协议和安全互锁。
+"""
+    return f"{guidance}\n\n需求ID: {req_id}\n需求描述:\n{requirement.strip()}\n\n请开始生成测试用例："
+
+def get_standard_prompt_template() -> str:
+    """返回在生成用例时使用的标准 Prompt 模板（占位符形式展示）。"""
+    return (
+        "[系统角色]\n"
+        "你是资深的OBC/CCU测试开发专家，精通电力电子、车载充电、CAN/CAN-FD协议、硬件交互、诊断与安全。\n\n"
+        "[可选背景知识]\n"
+        "如有背景知识，请充分结合理解。\n---\n{背景知识}\n---\n\n"
+        "[任务]\n"
+        "针对‘需求描述’，生成 {正向数} 条正向、{异常数} 条异常、{边界数} 条边界测试用例（共 {总用例数} 条），要求如下：\n\n"
+        "[CSV 列顺序]\n{列名逗号分隔}\n\n"
+        "[生成规则]\n"
+        "1. 仅输出原始 CSV 内容，不输出任何解释、代码块或多余文本。\n"
+        "2. 测试步骤应细致、可复现，单元格内用全角分号（；）分隔。\n"
+        "3. 前置条件为空填‘无’，如需特定硬件/线束/环境请明确。\n"
+        "4. 输入/参数需具体可执行（如VIN=1234, CAN_ID=0x18FF50E5, 电压=400V, 电流=50A），涉及信号/报文/物理操作要写明。\n"
+        "5. 预期结果应包含可观测阈值、时序、诊断码、功率/安全/互锁等判据（如：电流稳定在50A±5%持续10s，或下发BMS故障码0x1234）。\n"
+        "6. ‘需求编号’列填{需求编号}（或自动生成REQ-001/002…）。\n"
+        "7. ‘需求描述’列≤50字，精准概括需求关键点。\n"
+        "8. ‘需求追溯’列写明该用例验证的具体需求点、协议条款或场景。\n"
+        "9. 用例应覆盖典型流程、异常场景（如通信丢帧/超时/非法报文/硬件断开）、边界条件（如极限电压/温度/功率/时序）。\n"
+        "10. OBC/CCU关注：\n"
+        "    - 充电流程（插枪、授权、启动、完成、拔枪、异常中断）\n"
+        "    - CAN/CAN-FD报文交互、信号采集、诊断帧\n"
+        "    - 功率/温度/电流/电压边界、SOC阈值\n"
+        "    - 故障注入（丢帧、延迟、短路、信号异常）\n"
+        "    - 安全互锁、硬件状态检测、诊断码上报\n"
+        "    - 时序要求（如xx ms内响应/动作）\n"
+        "    - 物理操作与人机交互（如插拔枪、急停、授权流程）\n\n"
+        "[需求输入]\n"
+        "需求ID: {需求编号}\n"
+        "需求描述:\n{需求全文}\n\n"
+        "[输出]\n仅输出 CSV，无其他文字。"
+    )
+
+def get_output_format_template(headers: List[str] = None) -> str:
+    """返回标准的输出格式模板（CSV格式，第一行为表头，第二行为占位符示例）。"""
+    if headers is None:
+        headers = DEFAULT_HEADERS
+    header_line = ",".join(f'"{h}"' for h in headers)
+    example_line = ",".join(f'"{h}示例"' for h in headers)
+    return f"{header_line}\n{example_line}"
+
+REQ_ID_PATTERN = re.compile(r"\b(REQ-[A-Za-z0-9]+-\d{2,4})\b")
+
+def extract_req_id(text: str) -> Optional[str]:
+    """尝试从需求文本中抽取需求编号 (格式示例: REQ-OBC-001)。
+
+    若找到多个, 返回第一个。返回统一大写。未找到返回 None。
+    """
+    if not text:
+        return None
+    match = REQ_ID_PATTERN.search(text.upper())
+    if match:
+        return match.group(1).upper().rstrip(':')
+    return None
+
+# ===== 动态用例数量分配 =====
+KEYWORD_WEIGHTS = {
+    "异常": 1.0,
+    "错误": 1.0,
+    "故障": 1.1,
+    "超时": 0.9,
+    "边界": 0.8,
+    "限制": 0.6,
+    "保护": 0.7,
+    "降级": 0.9,
+    "重试": 0.8,
+    "安全": 0.7,
+    "加密": 0.6,
+}
+
+def _complexity_score(text: str) -> float:
+    if not text:
+        return 0.0
+    t = text.strip()
+    length = len(t)
+    sentences = len(re.findall(r"[。.!?]", t)) or 1
+    kw_score = 0.0
+    for k, w in KEYWORD_WEIGHTS.items():
+        cnt = t.count(k)
+        if cnt:
+            kw_score += cnt * w
+    # 归一化: 设计经验参数
+    base = (length / 300.0) + (sentences / 6.0) + (kw_score / 4.0)
+    return min(base / 3.0, 1.0)  # 限制 0~1
+
+def compute_dynamic_case_counts(text: str, min_total: int, max_total: int, pos_w: float, neg_w: float, edge_w: float) -> Tuple[int, int, int]:
+    score = _complexity_score(text)
+    total = int(round(min_total + (max_total - min_total) * score))
+    total = max(min_total, min(total, max_total))
+    weights = [max(pos_w, 0.01), max(neg_w, 0.01), max(edge_w, 0.01)]
+    w_sum = sum(weights)
+    raw_counts = [w / w_sum * total for w in weights]
+    # 初步四舍五入
+    counts = [max(1, int(round(c))) for c in raw_counts]
+    # 调整使得和=total
+    diff = sum(counts) - total
+    if diff != 0:
+        # 根据误差大小调整, 优先调整最大或最小的分类
+        for _ in range(abs(diff)):
+            if diff > 0:
+                # 需要减
+                idx = counts.index(max(counts))
+                if counts[idx] > 1:
+                    counts[idx] -= 1
+            else:
+                # 需要加
+                idx = counts.index(min(counts))
+                counts[idx] += 1
+    return counts[0], counts[1], counts[2]
+
+# ===== 单条需求 -> 多分支解析 =====
+BRANCH_BULLET_PATTERN = re.compile(r"^\s*(?:- |\* |\d+[).、]\s*|[（(]\d+[)）]\s*)")
+
+def split_requirement_into_branches(text: str, max_branches: int = 15) -> List[Dict[str, str]]:
+    """将单条原始需求拆分为多个可测试的『分支子需求』。
+
+    解析策略 (启发式):
+    1. 优先按换行中的项目符号/编号拆分 (数字. / （数字） / - / * )
+    2. 若未检测到明显条目, 尝试按句号/分号切成句子 (长度>15) 作为候选
+    3. 对过短 (<8) 行自动与后续合并
+    4. 限制最大分支数, 超过时截断并在最后追加一条『其余合并』
+    返回: [{'branch_index':1,'branch_id':'B01','title':'...','content':'...'}]
+    """
+    if not text or len(text.strip()) < 8:
+        return []
+    raw_lines = [l.rstrip() for l in text.strip().splitlines() if l.strip()]
+    candidates: List[str] = []
+    buffer = []
+    def flush_buffer():
+        if buffer:
+            merged = " ".join(buffer).strip()
+            if merged:
+                candidates.append(merged)
+            buffer.clear()
+
+    bullet_mode = any(BRANCH_BULLET_PATTERN.search(l) for l in raw_lines)
+    if bullet_mode:
+        for line in raw_lines:
+            if BRANCH_BULLET_PATTERN.search(line):
+                flush_buffer()
+                # 去掉前缀符号
+                cleaned = BRANCH_BULLET_PATTERN.sub("", line, count=1).strip()
+                buffer.append(cleaned)
+            else:
+                # 继续累积到当前分支
+                buffer.append(line.strip())
+        flush_buffer()
+    else:
+        # 句子切分 (中文句号/分号/英文标点)
+        sentences = re.split(r"(?<=[。；;.!?])\s+", text.strip())
+        for s in sentences:
+            s_clean = s.strip()
+            if len(s_clean) >= 15:
+                candidates.append(s_clean)
+        # 如果还没有, 整体作为一个
+        if not candidates:
+            candidates = [text.strip()]
+
+    # 合并过短片段 (<8) 到前一个
+    merged: List[str] = []
+    for seg in candidates:
+        if merged and len(seg) < 8:
+            merged[-1] = merged[-1] + " " + seg
+        else:
+            merged.append(seg)
+
+    # 截断与溢出处理
+    overflow = []
+    if len(merged) > max_branches:
+        overflow = merged[max_branches-1:]
+        merged = merged[:max_branches-1]
+        merged.append("其余合并: " + " | ".join(overflow[:5]) + (" ..." if len(overflow) > 5 else ""))
+
+    branches: List[Dict[str, str]] = []
+    for idx, seg in enumerate(merged, 1):
+        title = seg[:40].replace('\n', ' ').strip()
+        branches.append({
+            "branch_index": idx,
+            "branch_id": f"B{idx:02d}",
+            "title": title,
+            "content": seg.strip(),
+        })
+    return branches
+
+def get_requirement_templates() -> Dict[str, str]:
+    return {
+        "OBC 充电流程": """
+REQ-OBC-001: 【功能】车载充电机 (OBC)：插枪握手->授权->充电->停止
+场景包括：接地检测、互锁、限流、充电完成检测与故障处理
+验证点：握手时序、授权流程、充电参数协商、异常断开处理
+""",
+        "CCU 与 BMS 交互": """
+REQ-CCU-001: 【功能】CCU 请求 BMS 状态（SOC/温度/电压/故障码），处理超时与重试
+验证点：CAN通信时序、数据完整性、超时重试机制、故障码解析
+""",
+        "BMS SOC 与充放电策略": """
+REQ-BMS-001: 【功能】SOC 估算、温度相关充放电限制、低电量保护
+验证点：SOC精度、温度保护阈值、功率限制算法、保护策略触发
+""",
+        "EVCC 通信控制": """
+REQ-EVCC-001: 【功能】EVCC与充电桩通信：ISO15118协议、数字证书验证、充电参数协商
+验证点：协议握手、证书链验证、参数协商、通信安全性
+""",
+        "充电连接与断开流程": """
+REQ-CHG-001: 【功能】人机与硬件交互：插枪、授权、开始、完成、拔枪与强制中断场景
+验证点：物理连接检测、用户授权、充电启停、紧急断开
+""",
+    }
+
+def get_requirement_examples() -> List[str]:
+    return [
+        "OBC: 插枪后 5s 内未授权应取消请求",
+        "BMS: 温度>60°C 时限制充电电流至 0.2C",
+        "CCU: BMS 请求超时 100ms 后重试 3 次并记录故障",
+    ]
+
+@handle_errors
+def call_model(model: str, prompt: str, base_url: str, temperature: float = 0.2) -> str:
+    """调用模型: 优先 chat.completions, 需要时回退 completions.
+
+    回退条件: fallback 集合模型出现 400 且返回内容包含 prompt/field required/missing.
+    """
+    provider = MODEL_PROVIDER_HEADER.get(model, ROUTE_HEADER_VALUE)
+    debug = st.session_state.get("debug_mode", False)
+    actual_model = MODEL_MAP.get(model, model)
+
+    def _chat_payload() -> dict:
+        return {
+            "model": actual_model,
+            "messages": [
+                {"role": "system", "content": "你是测试用例生成助手，严格输出 CSV"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": 2000,
+        }
+
+    def _completions_payload() -> dict:
+        return {
+            "model": actual_model,
+            "prompt": "你是测试用例生成助手，严格输出 CSV。\n" + prompt,
+            "temperature": temperature,
+            "max_tokens": 2000,
+        }
+
+    def _do_request(url: str, payload: dict) -> requests.Response:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+            "X-Model-Provider-Id": provider,
+        }
+        return requests.post(url, headers=headers, json=payload, timeout=60)
+
+    chat_url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    comp_url = f"{base_url.rstrip('/')}/v1/completions"
+    fallback_allowed = {"Qwen-235B-A22B", "deepseek-v3.1", "Qwen2.5-VL-72B-Instruct-AWQ"}
+
+    # Chat 调用
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        try:
+            resp = _do_request(chat_url, _chat_payload())
+            if resp.status_code >= 500:
+                if debug:
+                    st.warning(f"[调试-chat] {attempt+1} 次 -> {resp.status_code}: {resp.text[:200]}")
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+            if resp.status_code == 400:
+                low = resp.text.lower()
+                if model in fallback_allowed and any(k in low for k in ["prompt", "field required", "missing"]):
+                    if debug:
+                        st.info("[调试] Chat 400 缺字段, 回退 completions")
+                    break
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response else None
+            if code in (502, 503, 504, 429) and attempt < MAX_RETRY_ATTEMPTS - 1:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            if code == 400:
+                if model not in fallback_allowed:
+                    raise e
+                break
+            raise e
+        except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+            if attempt == MAX_RETRY_ATTEMPTS - 1:
+                raise e
+            if debug:
+                st.warning(f"[调试-chat] 异常重试 {attempt+1}: {e}")
+            time.sleep(1.0 * (attempt + 1))
+    else:
+        if model not in fallback_allowed:
+            raise Exception("chat.completions 重试耗尽")
+
+    # 回退 completions
+    if model in fallback_allowed:
+        if debug:
+            st.info(f"[调试] 回退 completions 调用 {model}")
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                resp = _do_request(comp_url, _completions_payload())
+                if resp.status_code >= 500:
+                    if debug:
+                        st.warning(f"[调试-comp] {attempt+1} 次 -> {resp.status_code}: {resp.text[:200]}")
+                    if attempt < MAX_RETRY_ATTEMPTS - 1:
+                        time.sleep(1.2 * (attempt + 1))
+                        continue
+                resp.raise_for_status()
+                data = resp.json()
+                if "choices" in data and data["choices"]:
+                    c0 = data["choices"][0]
+                    if isinstance(c0, dict):
+                        if "message" in c0 and "content" in c0["message"]:
+                            return c0["message"]["content"]
+                        if "text" in c0:
+                            return c0["text"]
+                return json.dumps(data, ensure_ascii=False)[:4000]
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code if e.response else None
+                if code in (502, 503, 504, 429) and attempt < MAX_RETRY_ATTEMPTS - 1:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+                raise e
+            except (requests.exceptions.RequestException, KeyError, IndexError) as e:
+                if attempt == MAX_RETRY_ATTEMPTS - 1:
+                    raise e
+                if debug:
+                    st.warning(f"[调试-comp] 异常重试 {attempt+1}: {e}")
+                time.sleep(1.0 * (attempt + 1))
+        raise Exception("completions 回退也失败")
+
+    raise Exception("模型调用失败 (未命中成功路径)")
+
+@handle_errors
+def parse_csv_to_df(csv_text: str, expected_headers: List[str]) -> pd.DataFrame:
+    if not csv_text or not csv_text.strip(): raise ValueError("CSV 内容为空")
+    cleaned = csv_text.strip()
+    cleaned = re.sub(r"^```.*?\n", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\n```$", "", cleaned)
+    cleaned = cleaned.replace("\ufeff", "")
+    lines = [l for l in cleaned.splitlines() if l.strip()]
+    if not lines: raise ValueError("CSV 内容为空（清理后）")
+    text = "\n".join(lines)
+    try:
+        sniffer = csv.Sniffer(); dialect = sniffer.sniff(text[:4096], delimiters=",;\t|")
+        delimiter = dialect.delimiter
+    except Exception:
+        delimiter = ','
+    reader = csv.reader(StringIO(text), delimiter=delimiter, quotechar='"')
+    rows = [r for r in reader if any(cell.strip() for cell in r)]
+    if not rows: raise ValueError("CSV 内容无法解析为行")
+    def _normalize_rows(rows_list, n_cols, delim):
+        normalized = []
+        for r in rows_list:
+            r = [c.strip().strip('"') for c in r]
+            if len(r) <= n_cols: normalized.append(r + [""] * (n_cols - len(r)))
+            else:
+                merged_last = delim.join(r[n_cols - 1:]); normalized.append(r[:n_cols - 1] + [merged_last])
+        return normalized
+    header = [c.strip().strip('"') for c in rows[0]]
+    matches = sum(1 for h in header if any(exp in h or h in exp for exp in expected_headers))
+    if matches >= max(1, len(expected_headers)//2):
+        data_rows = rows[1:]
+        if not all(len(r)==len(header) for r in data_rows): data_rows = _normalize_rows(data_rows, len(header), delimiter)
+        df = pd.DataFrame(data_rows, columns=header)
+    else:
+        if all(len(r)==len(expected_headers) for r in rows):
+            df = pd.DataFrame(rows, columns=expected_headers)
+        else:
+            normalized = _normalize_rows(rows, len(expected_headers), delimiter)
+            df = pd.DataFrame(normalized, columns=expected_headers)
+    return df.fillna("").astype(str)
+
+def make_excel_download(df: pd.DataFrame, filename: str = "测试用例.xlsx") -> None:
+    if df is None or (hasattr(df, "empty") and df.empty): st.warning("没有数据可导出"); return
+    buf = BytesIO();
+    with pd.ExcelWriter(buf, engine='openpyxl') as w: df.to_excel(w, index=False, sheet_name='测试用例')
+    buf.seek(0)
+    st.download_button("💾 下载 Excel", data=buf, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"dxl_{uuid.uuid4().hex}")
+
+def make_csv_download(df: pd.DataFrame, filename: str = "测试用例.csv") -> None:
+    if df is None or (hasattr(df, "empty") and df.empty): st.warning("没有数据可导出"); return
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("💾 下载 CSV", data=csv_bytes, file_name=filename, mime="text/csv", key=f"dcsv_{uuid.uuid4().hex}")
+
+def process_batch_requirements(base_url: str, requirements: List[str], headers: List[str], model: str, pos_n: int, neg_n: int, edge_n: int, temperature: float, background_knowledge: Optional[str] = None, *, dynamic: bool = False, dyn_params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    all_cases = []
+    pb = st.progress(0)
+    status = st.empty()
+    total = len(requirements)
+    used_ids = set()
+    for i, req in enumerate(requirements):
+        pb.progress((i + 1) / total)
+        status.text(f"处理中 {i+1}/{total}")
+        extracted = extract_req_id(req)
+        if extracted:
+            req_id = extracted
+            if req_id in used_ids:  # 简单重复处理
+                suffix = 2
+                new_id = f"{req_id}-DUP{suffix}"
+                while new_id in used_ids:
+                    suffix += 1
+                    new_id = f"{req_id}-DUP{suffix}"
+                req_id = new_id
+        else:
+            req_id = f"REQ-{i+1:03d}"
+        used_ids.add(req_id)
+        local_pos, local_neg, local_edge = pos_n, neg_n, edge_n
+        if dynamic:
+            p = dyn_params or {}
+            local_pos, local_neg, local_edge = compute_dynamic_case_counts(
+                req,
+                p.get("min_total", 3),
+                p.get("max_total", 9),
+                p.get("pos_w", 3.0),
+                p.get("neg_w", 2.0),
+                p.get("edge_w", 2.0),
+            )
+            if st.session_state.get("debug_mode"):
+                st.write(f"{req_id} 动态分配 -> 正向:{local_pos} 异常:{local_neg} 边界:{local_edge}")
+        prompt = build_prompt(req, headers, local_pos, local_neg, local_edge, req_id, background_knowledge)
+        text = call_model(model, prompt, base_url, temperature)
+        if text:
+            df = parse_csv_to_df(text, headers)
+            if df is not None and not df.empty:
+                if "需求编号" not in df.columns:
+                    df.insert(0, "需求编号", req_id)
+                else:
+                    # 填充空值 / 纠正首行缺失
+                    df['需求编号'] = df['需求编号'].astype(str)
+                    df['需求编号'] = df['需求编号'].where(df['需求编号'].str.strip() != "", req_id)
+                if "需求描述" not in df.columns:
+                    df.insert(1, "需求描述", req[:100])
+                all_cases.append(df)
+        if i < total - 1:
+            time.sleep(2)
+    pb.empty(); status.empty()
+    if all_cases:
+        return pd.concat(all_cases, ignore_index=True)
+    raise ValueError("未生成任何用例")
+
+@handle_errors
+def read_background_doc(file: Optional[Any]) -> Optional[str]:
+    if file is None: return None
+    name = file.name.lower()
+    if name.endswith('.docx'): return read_word(file)
+    if name.endswith(('.txt', '.md')): return StringIO(file.getvalue().decode("utf-8")).read()
+    if name.endswith('.pdf'):
+        try:
+            # 尝试导入PDF处理库
+            from PyPDF2 import PdfReader
+            pdf = PdfReader(BytesIO(file.getvalue()))
+            text = ""
+            for page in pdf.pages:
+                text += page.extract_text() + "\n"
+            return text.strip()
+        except ImportError:
+            st.error("PDF处理需要安装 PyPDF2 库。请运行: pip install PyPDF2")
+            return None
+        except Exception as e:
+            st.error(f"PDF读取失败: {e}")
+            return None
+    st.warning("不支持的文件类型，请使用 .docx, .txt, .md 或 .pdf")
+    return None
+
+def setup_sidebar() -> Tuple[str, str, float, List[str], int, int, int, bool, Dict[str, Any]]:
+    with st.sidebar:
+        st.header("连接设置")
+        st.caption("当前使用硬编码 API Key (界面不再提供修改)。")
+        # 模型标签展示 (免费 / 计费)
+        model_display = {m: f"{m} {MODEL_PRICING_TAG.get(m,'')}" for m in ALLOWED_MODELS}
+        model_choice = st.selectbox("模型 (MiMo免费 / 其他计费)", list(model_display.keys()), format_func=lambda k: model_display[k])
+        model = model_choice
+        base_url = st.text_input("API Base URL", value=DEFAULT_BASE_URL)
+        st.checkbox("调试模式", value=False, key="debug_mode", help="显示重试 / 原始错误片段，协助排查 502 等问题")
+        temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+        st.divider(); st.header("背景知识 (可选)")
+        background_doc = st.file_uploader("上传背景文档", type=["docx", "txt", "md", "pdf"])
+        if background_doc:
+            if st.session_state.get('last_background_doc_name') != background_doc.name:
+                content = read_background_doc(background_doc)
+                st.session_state['background_knowledge'] = content
+                st.session_state['last_background_doc_name'] = background_doc.name
+                if content:
+                    st.success("已加载背景")
+        else:
+            st.session_state.pop('background_knowledge_file', None)
+            st.session_state.pop('last_background_doc_name', None)
+
+        # 直接文本输入背景知识
+        st.markdown("**直接输入背景知识 (粘贴文档内容)**")
+        direct_text = st.text_area("背景知识文本", placeholder="粘贴文档内容、需求规格说明等...", height=150, key="direct_background_text")
+        if direct_text and direct_text.strip():
+            st.session_state['background_knowledge'] = direct_text.strip()
+            st.success("已设置背景知识文本")
+        elif not background_doc and not st.session_state.get('background_urls_content'):
+            st.session_state.pop('background_knowledge', None)
+
+        # 多个 URL 输入
+        st.markdown("**网页链接 (每行一个 URL，可与文档混合)**")
+        url_text = st.text_area("背景链接列表", placeholder="https://example.com/doc1\nhttps://example.com/spec", height=110)
+        load_urls = st.button("加载链接内容")
+        if load_urls:
+            raw_urls = [u.strip() for u in url_text.splitlines() if u.strip()]
+            valid_urls = [u for u in raw_urls if _is_valid_url(u)]
+            bad_urls = [u for u in raw_urls if u and u not in valid_urls]
+            fetched = []
+            for u in valid_urls[:8]:  # 限制最多 8 个，避免过慢
+                with st.spinner(f"抓取 {u} ..."):
+                    txt = fetch_url_content(u)
+                fetched.append((u, txt))
+            st.session_state['background_urls'] = valid_urls
+            st.session_state['background_urls_content'] = fetched
+            if bad_urls:
+                st.warning(f"无效链接已忽略: {len(bad_urls)}")
+            st.success(f"已获取 {len(fetched)} 个链接")
+
+        # 组合背景 (文档 + 直接文本 + URL)
+        combined_parts = []
+        if st.session_state.get('background_knowledge') and not st.session_state.get('direct_background_text'):
+            # 如果有上传的文档内容且没有直接输入，则使用文档内容
+            combined_parts.append("【文档内容】\n" + st.session_state['background_knowledge'])
+        if st.session_state.get('direct_background_text') and st.session_state.get('direct_background_text').strip():
+            combined_parts.append("【直接输入】\n" + st.session_state['direct_background_text'].strip())
+        if st.session_state.get('background_urls_content'):
+            for u, txt in st.session_state['background_urls_content']:
+                combined_parts.append(f"【网页摘录】{u}\n{txt}")
+        combined_text = "\n\n".join(combined_parts) if combined_parts else None
+        st.session_state['background_knowledge'] = combined_text
+
+        if combined_text:
+            with st.expander("查看合并背景 (前500字符)"):
+                st.text(combined_text[:500] + ("..." if len(combined_text) > 500 else ""))
+        st.divider(); st.header("用例配置")
+        headers_text = st.text_input("列名", value=",".join(DEFAULT_HEADERS))
+        headers = [h.strip() for h in headers_text.split(",") if h.strip()]
+        auto_mode = st.checkbox("按需求自动分配用例数量", value=False, help="基于需求长度/关键词动态确定正向/异常/边界数量")
+        dyn_params: Dict[str, Any] = {}
+        if auto_mode:
+            c1, c2 = st.columns(2)
+            with c1:
+                min_total = st.number_input("最小总数", 3, 30, 3)
+                pos_w = st.number_input("正向权重", 0.5, 10.0, 3.0, 0.5)
+            with c2:
+                max_total = st.number_input("最大总数", 3, 50, 9)
+                neg_w = st.number_input("异常权重", 0.5, 10.0, 2.0, 0.5)
+            edge_w = st.number_input("边界权重", 0.5, 10.0, 2.0, 0.5)
+            dyn_params = {"min_total": min_total, "max_total": max_total, "pos_w": pos_w, "neg_w": neg_w, "edge_w": edge_w}
+            st.caption("根据需求复杂度 (长度/句子数/风险关键词) 在线计算用例数量")
+            # 占位固定值 (不会被使用)
+            pos_n = neg_n = edge_n = 0
+        else:
+            pos_n = st.number_input("正向", 1, 20, 2)
+            neg_n = st.number_input("异常", 1, 20, 2)
+            edge_n = st.number_input("边界", 1, 20, 2)
+        st.divider()
+        st.subheader("飞书API配置 (可选)")
+        st.caption("用于访问飞书文档作为背景知识。需要先在飞书开发者后台配置应用并获取凭证。")
+        st.info("💡 **飞书文档访问提示**: 如果遇到权限问题，可以：1) 在飞书中导出文档为Word/PDF后上传；2) 复制文档内容直接粘贴到上方文本框；3) 分享文档为公开链接")
+        feishu_app_id = st.text_input("飞书应用ID", placeholder="cli_xxx", help="从飞书开发者后台获取")
+        feishu_app_secret = st.text_input("飞书应用密钥", type="password", placeholder="xxx", help="从飞书开发者后台获取")
+        if feishu_app_id and feishu_app_secret:
+            # 存储到环境变量或session
+            os.environ["FEISHU_APP_ID"] = feishu_app_id
+            os.environ["FEISHU_APP_SECRET"] = feishu_app_secret
+            st.success("飞书API凭证已配置")
+        elif feishu_app_id or feishu_app_secret:
+            st.warning("请同时提供飞书应用ID和应用密钥")
+        else:
+            st.info("未配置飞书API凭证，将使用网页抓取方式访问飞书文档")
+        return base_url, model, temperature, headers, pos_n, neg_n, edge_n, auto_mode, dyn_params
+
+from app_handlers import (
+    handle_single_requirement,
+    handle_batch_processing,
+    handle_help_page
+)
+
+import streamlit as st
+from typing import Dict, Any, List, Tuple
+from app_handlers import (
+    handle_single_requirement,
+    handle_batch_processing,
+    handle_help_page
+)
+
+def setup_session():
+    """初始化会话状态"""
+    if 'requirements_initialized' not in st.session_state:
+        st.session_state.requirements_initialized = True
+        st.session_state.collected_requirements = []
+        st.session_state.source_counts = []
+        st.session_state.last_batch_result = None
+
+# 这些函数已移至 app_handlers.py
+
+def initialize_session_state():
+    """初始化Streamlit会话状态变量"""
+    session_vars = {
+        'requirements_initialized': True,
+        'collected_requirements': [],
+        'source_counts': [],
+        'last_batch_result': None,
+        'background_knowledge': None,
+        'background_file': None,
+        'background_urls': [],
+        'background_urls_content': [],
+        'debug_mode': False,
+        'direct_background_text': ""
+    }
+    
+    for var, default in session_vars.items():
+        if var not in st.session_state:
+            st.session_state[var] = default
+
+def initialize_session_state():
+    """初始化Streamlit会话状态变量"""
+    session_vars = {
+        'requirements_initialized': True,
+        'collected_requirements': [],
+        'source_counts': [],
+        'last_batch_result': None,
+        'background_knowledge': None,
+        'background_file': None,
+        'background_urls': [],
+        'background_urls_content': [],
+        'debug_mode': False,
+        'direct_background_text': ""
+    }
+    
+    for var, default in session_vars.items():
+        if var not in st.session_state:
+            st.session_state[var] = default
+
+def main() -> None:
+    """主应用入口点"""
+    try:
+        # 设置页面配置
+        st.set_page_config(
+            page_title="AI 测试用例生成器",
+            page_icon="🔍",
+            layout="wide"
+        )
+        
+        # 初始化会话状态
+        initialize_session_state()
+        
+        # 页面标题
+        st.title("AI 测试用例生成器 - 电力电子")
+        
+        # 设置侧边栏配置
+        base_url, model, temperature, headers, pos_n, neg_n, edge_n, auto_mode, dyn_params = setup_sidebar()
+        
+        # 创建主标签页
+        tab1, tab2, tab3 = st.tabs(["单条需求 💡", "批量处理 📑", "帮助 ❓"])
+        
+        # 处理各标签页内容
+        with tab1:
+            handle_single_requirement(
+                base_url=base_url,
+                model=model,
+                temperature=temperature,
+                headers=headers,
+                pos_n=pos_n,
+                neg_n=neg_n,
+                edge_n=edge_n,
+                auto_mode=auto_mode,
+                dyn_params=dyn_params
+            )
+            
+        with tab2:
+            handle_batch_processing(
+                base_url=base_url,
+                model=model,
+                temperature=temperature,
+                headers=headers,
+                pos_n=pos_n,
+                neg_n=neg_n,
+                edge_n=edge_n,
+                auto_mode=auto_mode,
+                dyn_params=dyn_params
+            )
+            
+        with tab3:
+            handle_help_page()
+            
+    except Exception as e:
+        st.error("应用程序发生错误")
+        if st.session_state.get("debug_mode"):
+            st.exception(e)
+        logger.exception("应用程序错误")
+
+if __name__ == '__main__':
+    main()
+import pandas as pd
+import plotly.express as px
+from typing import Dict, Any, List, Optional
+
+from helper_functions import (
+    render_batch_input, MIN_PARAGRAPH_LENGTH,
+    read_excel, read_word, read_background_doc,
+    fetch_feishu_document
+)
+
+API_BASE_URL = "https://api.your-server.com/v1"  # AI 接口基础 URL
+
+def generate_testcases(requirement: str) -> List[Dict[str, str]]:
+    """根据需求生成测试用例
+    
+    Args:
+        requirement: 需求描述文本
+    
+    Returns:
+        测试用例列表
+    """
+    try:
+        # 这里添加实际的测试用例生成逻辑
+        # 目前返回一个示例测试用例
+        return [{
+            "title": "基本功能测试",
+            "priority": "高",
+            "precondition": "系统正常运行",
+            "steps": "1. 执行主要功能\n2. 验证结果",
+            "expected": "功能正常执行,结果符合预期"
+        }]
+    except Exception as e:
+        st.error(f"生成测试用例失败: {e}")
+        return []
+
+def read_excel(file: BytesIO) -> Dict[str, pd.DataFrame]:
+    """读取Excel文件内容
+    
+    Args:
+        file: 上传的Excel文件对象
+    
+    Returns:
+        工作表名称到数据表的映射字典
+    """
+    try:
+        return pd.read_excel(file, sheet_name=None)
+    except Exception as e:
+        st.error(f"Excel读取失败: {e}")
+        return {}
+
+def read_word(file: BytesIO) -> str:
+    """读取Word文件内容
+    
+    Args:
+        file: 上传的Word文件对象
+    
+    Returns:
+        文件内容字符串
+    """
+    try:
+        doc = Document(file)
+        return "\n".join(p.text for p in doc.paragraphs)
+    except Exception as e:
+        st.error(f"Word读取失败: {e}")
+        return ""
+
+def read_background_doc(file: BytesIO) -> str:
+    """读取PDF等背景文档
+    
+    Args:
+        file: 上传的文件对象
+    
+    Returns:
+        文件内容字符串
+    """
+    try:
+        # 使用PDF解析库读取内容
+        # 目前简单返回空字符串
+        return ""
+    except Exception as e:
+        st.error(f"文件读取失败: {e}")
+        return ""
+
+def fetch_feishu_document(url_or_id: str) -> Optional[str]:
+    """读取飞书文档内容
+    
+    Args:
+        url_or_id: 飞书文档URL或ID
+    
+    Returns:
+        文档内容字符串,失败返回None
+    """
+    try:
+        # 使用飞书API读取文档
+        # 目前简单返回None
+        return None
+    except Exception as e:
+        st.error(f"飞书文档读取失败: {e}")
+        return None
+    # 导入必要的模块
+    import streamlit as st
+    from requirements_manager import RequirementsManager
+    import pandas as pd
+    from io import BytesIO, StringIO
+    from docx import Document
+    import re
+    
+    # 初始化全局样式和配置
+    st.set_page_config(
+        page_title="需求分析助手",
+        page_icon="📝",
+        layout="wide"
+    )
+    
+    # 初始化上下文
+    context = {
+        'reqmgr': RequirementsManager()
+    }
+    
+    # 显示标题和说明
+    st.title("需求分析助手")
+    st.write(
+        """
+        这是一个帮助分析和管理需求的工具。你可以:
+        - 从多种来源导入需求(飞书文档、Excel、Word等)
+        - 交互式分析每条需求并生成测试用例
+        - 在看板中查看整体进度
+        """
+    )
+    
+    # 创建标签页
+    tab1, tab2, tab3 = st.tabs(["批量导入 📥", "交互式分析 🔍", "看板 📊"])
+
+    # 批量导入标签页
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            render_batch_input(context)
+        with col2:
+            render_batch_preview(context)
+
+    # 交互式分析标签页
+    with tab2:
+        col1, col2 = st.columns(2)
+        with col1:
+            render_manual_input(context)
+        with col2:
+            render_testcase_preview(context)
+    
+    # 看板标签页
+    with tab3:
+        render_dashboard(context)
+        
+        if st.button("生成"):
+            auto_req_id = req_id.strip() or extract_req_id(req_text) or ""
+            if not req_id.strip() and auto_req_id:
+                st.info(f"自动识别需求编号: {auto_req_id}")
+            
+            placeholder = st.empty()
+            progress = st.progress(0)
+            
+            try:
+                local_pos = pos_n
+                local_neg = neg_n
+                local_edge = edge_n
+                
+                if auto_mode:
+                    local_pos, local_neg, local_edge = compute_dynamic_case_counts(
+                        req_text,
+                        dyn_params.get("min_total", 3),
+                        dyn_params.get("max_total", 9),
+                        dyn_params.get("pos_w", 3.0),
+                        dyn_params.get("neg_w", 2.0),
+                        dyn_params.get("edge_w", 2.0),
+                    )
+                    st.info(f"动态分配 -> 正向:{local_pos} 异常:{local_neg} 边界:{local_edge} (总计:{local_pos+local_neg+local_edge})")
+                
+                prompt = build_prompt(
+                    req_text, 
+                    headers, 
+                    local_pos,
+                    local_neg, 
+                    local_edge,
+                    auto_req_id,
+                    st.session_state.get('background_knowledge')
+                )
+                
+                placeholder.info("生成中...")
+                progress.progress(10)
+                
+                text = call_model(model, prompt, base_url, temperature)
+                progress.progress(80)
+                
+                if text:
+                    df = parse_csv_to_df(text, headers)
+                    progress.progress(95)
+                    
+                    if df is None or df.empty:
+                        placeholder.error("解析失败")
+                    else:
+                        if "需求编号" in df.columns and auto_req_id:
+                            df['需求编号'] = df['需求编号'].astype(str)
+                            df['需求编号'] = df['需求编号'].where(df['需求编号'].str.strip() != "", auto_req_id)
+                        elif auto_req_id and "需求编号" not in df.columns:
+                            df.insert(0, "需求编号", auto_req_id)
+                        
+                        st.dataframe(df, use_container_width=True)
+                        make_excel_download(df)
+                        make_csv_download(df)
+                        progress.progress(100)
+                        placeholder.success("完成")
+            except Exception as e:
+                progress.empty()
+                placeholder.error(f"生成失败: {e}")
+    
+    # 批量处理标签页
+    with tab2:
+        st.subheader("批量导入需求")
+        # 创建左右两列
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 需求输入")
+            render_batch_input(ctx)
+            
+        with col2:
+            st.markdown("### 需求预览与生成")
+            render_batch_preview(ctx)
+            
+from app_handlers import handle_help_page  # 从app_handlers导入
+    
+    # 示例展示
+    st.markdown("### 📝 需求示例")
+    for example in get_requirement_examples():
+        st.markdown(f"- {example}")
+    
+    # 背景知识设置
+    st.markdown("""
+    ### 📚 背景知识设置
+    
+    **支持的输入方式：**
+    - 📄 **文件上传**
+      - Word文档 (.docx)
+      - 文本文件 (.txt)
+      - Markdown (.md)
+      - PDF文档 (.pdf)
+    
+    - 📝 **直接输入**
+      - 复制粘贴文档内容
+      - 支持多段落格式
+    
+    - 🌐 **网页链接**
+      - 自动抓取网页内容
+      - 智能清理HTML标签
+      - 支持多个URL
+    
+    - 🪶 **飞书文档**
+      - API直接访问
+      - 保留文档结构
+      - 支持docx和wiki
+    
+    **飞书文档访问说明：**
+    1. API访问需要文档权限和凭证
+    2. 遇到权限问题时的替代方案：
+       - 导出为Word/PDF后上传
+       - 复制内容到输入框
+       - 设置为公开文档
+    """)
+    
+    # 数据格式
+    st.markdown("### 📊 数据格式")
+    
+    st.markdown("**CSV输出格式：**")
+    output_tpl = get_output_format_template()
+    st.code(output_tpl, language="csv")
+    st.caption("标准CSV格式说明：第一行为表头，下面为数据行")
+    
+    # 提示词模板
+    st.markdown("### 🤖 提示词模板")
+    tpl = get_standard_prompt_template()
+    st.code(tpl, language="text")
+    st.caption("""
+    模板参数说明：
+    - {背景知识}: 上下文信息
+    - {列名}: CSV表头定义
+    - {需求编号}: 需求追踪ID
+    - {需求全文}: 完整需求描述
+    - {正向数}/{异常数}/{边界数}: 用例数量分配
+    """)
+    
+    # 模型说明
+    st.markdown("""
+    ### 🚀 模型说明
+    
+    当前支持的模型：
+    - **MiMo-7B-RL**: 免费使用
+    - **Qwen-235B-A22B**: 计费使用
+    - **deepseek-v3.1**: 计费使用
+    - **Qwen2.5-VL-72B**: 计费使用
+    
+    💡 所有模型使用固定的内部API密钥
+    """)
+    
+    # 使用建议
+    st.markdown("""
+    ### 💡 使用建议
+    
+    1. **需求编写**
+       - 使用清晰的描述
+       - 避免歧义表达
+       - 包含具体参数
+    
+    2. **背景知识**
+       - 提供完整上下文
+       - 包含相关规范
+       - 说明技术限制
+    
+    3. **用例生成**
+       - 合理分配数量
+       - 注意边界场景
+       - 验证输出结果
+    """)
+    
+    # 故障排除
+    st.markdown("""
+    ### ⚠️ 常见问题
+    
+    1. **飞书文档访问失败**
+       - 检查文档权限
+       - 确认API凭证
+       - 使用替代方案
+    
+    2. **生成结果异常**
+       - 完善需求描述
+       - 补充背景知识
+       - 调整模型参数
+    
+    3. **批量处理慢**
+       - 减少并行数量
+       - 控制单次数量
+       - 分批次处理
+    """)
+    
+    # 反馈渠道
+    st.markdown("""
+    ### 📮 问题反馈
+    
+    如有问题或建议，请通过以下方式反馈：
+    1. 提交详细的问题描述
+    2. 附上相关的日志信息
+    3. 说明使用的环境配置
+    """)
+
+if __name__ == '__main__':
+    main()
+                else:
+                    # 分支解析
+                    branches = split_requirement_into_branches(req_text, max_branches=max_branches)
+                    if not branches:
+                        st.warning("未解析出有效分支，回退为整体生成")
+                        branches = [{"branch_index":1, "branch_id":"B01", "title":"整体", "content":req_text}]
+                    st.info(f"解析得到 {len(branches)} 个分支")
+                    # 分支用例分配策略
+                    branch_cases: List[Tuple[Dict[str,str], Tuple[int,int,int]]] = []
+                    # 手动固定
+                    manual_tuple = None
+                    if branch_strategy == "手动固定" and manual_counts_text:
+                        try:
+                            parts = [int(x) for x in re.split(r"[，,]\s*", manual_counts_text) if x.strip()][:3]
+                            if len(parts)==3 and all(p>0 for p in parts):
+                                manual_tuple = tuple(parts)  # type: ignore
+                        except Exception:
+                            pass
+                        if not manual_tuple:
+                            st.warning("手动固定格式不正确，将回退为均分")
+                    # 预计算复杂度用于动态策略
+                    scores = [ _complexity_score(b['content']) for b in branches ]
+            except Exception as e:
+                progress.empty()
+                placeholder.error(f"生成失败: {str(e)}")
+
+        try:
+            with tab2:
+                st.subheader("批量导入需求")
+                # 导入必要的模块
+                import requirements_manager as reqmgr
+                import pandas as pd
+                from docx import Document
+                import PyPDF2
+                from io import BytesIO, StringIO
+                import re
+                from test_batch import BatchProcessor
+                
+                # 创建左右两列布局
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("### 需求输入")
+                    
+                    # 清空按钮
+                    if st.button("🗑️ 清空所有需求"):
+                        reqmgr.clear_requirements()
+                        st.success("已清空所有需求")
+                    
+                    # 1. 飞书文档输入
+                    feishu_doc = st.text_input("飞书文档链接或ID", 
+                                           placeholder="输入飞书文档链接或ID")
+                    if feishu_doc:
+                        try:
+                            with st.spinner("正在读取飞书文档..."):
+                                doc_content = fetch_feishu_document(feishu_doc)
+                                if doc_content:
+                                    parts = re.split(r"\n\s*\n+", doc_content.strip())
+                                    feishu_reqs = [p for p in parts 
+                                                 if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    if feishu_reqs:
+                                        reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                                        st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                        except Exception as e:
+                            st.error(f"飞书文档读取失败: {e}")
+                    
+                    # 2. 文件上传
+                    uploaded_files = st.file_uploader(
+                        "上传需求文件",
+                        type=["xlsx", "docx", "pdf", "txt", "csv"],
+                        accept_multiple_files=True
+                    )
+                
+                    if uploaded_files:
+                        for file in uploaded_files:
+                            try:
+                                if file.name.lower().endswith('.xlsx'):
+                                    with st.spinner(f"正在处理 Excel 文件 {file.name}..."):
+                                        df = pd.read_excel(file)
+                                        df_reqs = df['需求描述'].dropna().tolist()
+                                        if df_reqs:
+                                            reqmgr.add_requirements_batch(df_reqs, f"Excel-{file.name}")
+                                            st.success(f"已导入 {len(df_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.docx'):
+                                    with st.spinner(f"正在处理 Word 文件 {file.name}..."):
+                                        doc = Document(file)
+                                        word_reqs = [p.text.strip() for p in doc.paragraphs 
+                                                   if len(p.text.strip()) > MIN_PARAGRAPH_LENGTH]
+                                        if word_reqs:
+                                            reqmgr.add_requirements_batch(word_reqs, f"Word-{file.name}")
+                                            st.success(f"已导入 {len(word_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.pdf'):
+                                    with st.spinner(f"正在处理 PDF 文件 {file.name}..."):
+                                        pdf_reader = PyPDF2.PdfReader(BytesIO(file.read()))
+                                        pdf_reqs = []
+                                        for page in pdf_reader.pages:
+                                            text = page.extract_text()
+                                            parts = re.split(r"\n\s*\n+", text.strip())
+                                            pdf_reqs.extend([p for p in parts 
+                                                           if len(p.strip()) > MIN_PARAGRAPH_LENGTH])
+                                        if pdf_reqs:
+                                            reqmgr.add_requirements_batch(pdf_reqs, f"PDF-{file.name}")
+                                            st.success(f"已导入 {len(pdf_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith(('.txt', '.csv')):
+                                    with st.spinner(f"正在处理文本文件 {file.name}..."):
+                                        stringio = StringIO(file.getvalue().decode("utf-8"))
+                                        lines = [l.strip() for l in stringio.readlines() 
+                                               if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                                        if lines:
+                                            reqmgr.add_requirements_batch(lines, f"Text-{file.name}")
+                                            st.success(f"已导入 {len(lines)} 条需求")
+                            except Exception as e:
+                                st.error(f"处理文件 {file.name} 失败: {e}")
+                
+                # 3. 手动输入
+                manual_reqs = st.text_area(
+                    "直接输入需求（每行一条）",
+                    placeholder="需求1\n需求2\n需求3...",
+                    height=150
+                )
+                
+                if st.button("添加手工输入"):
+                    if manual_reqs:
+                        lines = [l.strip() for l in manual_reqs.splitlines() 
+                                if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                        if lines:
+                            reqmgr.add_requirements_batch(lines, "手工输入")
+                            st.success(f"已添加 {len(lines)} 条需求")
+                    else:
+                        st.warning("请输入需求内容")
+            
+            with col2:
+                st.markdown("### 需求预览与生成")
+                
+                # 获取去重需求
+                unique_reqs = reqmgr.get_unique_requirements()
+                
+                # 显示统计信息
+                source_summary = reqmgr.get_source_summary()
+                if source_summary:
+                    st.info(f"数据来源: {source_summary}")
+                    st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+                # 预览表格
+                if unique_reqs:
+                    preview_df = pd.DataFrame(unique_reqs)
+                    st.dataframe(preview_df, use_container_width=True)
+                    
+                    st.divider()
+                    st.markdown("### 生成设置")
+                    
+                    parallel = st.number_input("并行处理数", 1, 8, 4)
+                    progress_ph = st.empty()
+                    result_ph = st.empty()
+                    
+                    if st.button("开始批量生成", type="primary"):
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 创建处理器
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 准备需求列表
+                            req_list = reqmgr.get_requirements_for_batch()
+                            
+                            # 执行生成
+                            df_result = processor.process_batch(req_list)
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 准备下载
+                                excel_data = BytesIO()
+                                with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                    df_result.to_excel(writer, index=False)
+                                excel_data.seek(0)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=excel_data,
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+                    else:
+                        st.warning("请先添加需求")
+def handle_file_upload():
+    """处理文件上传界面"""
+    try:
+        # 清空按钮
+        if st.button("🗑️ 清空所有需求"):
+            st.session_state.collected_requirements = []
+            st.session_state.source_counts = []
+            st.success("已清空所有需求")
+
+        # 文件上传
+        uploaded_files = st.file_uploader(
+            "上传需求文件",
+            type=["xlsx", "docx", "pdf", "txt", "csv"],
+            accept_multiple_files=True
+        )
+        
+        if uploaded_files:
+            for file in uploaded_files:
+                try:
+                    name = file.name.lower()
+                    if name.endswith('.xlsx'):
+                        _process_excel_file(file)
+                    elif name.endswith('.docx'):
+                        _process_word_file(file)
+                    elif name.endswith('.pdf'):
+                        _process_pdf_file(file)
+                    elif name.endswith(('.txt', '.csv')):
+                        _process_text_file(file)
+                except Exception as e:
+                    st.error(f"处理文件 {file.name} 失败: {e}")
+        
+        # 手动输入
+        return st.text_area(
+            "直接输入需求（每行一条）",
+            placeholder="需求1\n需求2\n需求3...",
+            height=150
+        )
+    except Exception as e:
+        st.error(f"文件上传处理错误: {e}")
+        if st.session_state.get("debug_mode"):
+            st.exception(e)
+        return None
+
+    if st.button("添加手工输入"):
+        if manual_reqs:
+            lines = [l.strip() for l in manual_reqs.splitlines() 
+                   if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+            if lines:
+                for line in lines:
+                    st.session_state.collected_requirements.append({
+                        "需求编号": "",
+                        "需求描述": line,
+                        "来源": "手工输入"
+                    })
+                st.session_state.source_counts.append(f"手工:{len(lines)}")
+                st.success(f"已添加 {len(lines)} 条需求")
+        else:
+            st.warning("请输入需求内容")
+            import pandas as pd
+            from docx import Document
+            import PyPDF2
+            from io import BytesIO, StringIO
+            import re
+            
+            # 清空按钮
+            if st.button("🗑️ 清空所有需求"):
+                reqmgr.clear_requirements()
+                st.success("已清空所有需求")
+            
+            # 1. 飞书文档输入
+            feishu_doc = st.text_input("飞书文档链接或ID", 
+                                     placeholder="输入飞书文档链接或ID")
+            if feishu_doc:
+                try:
+                    with st.spinner("正在读取飞书文档..."):
+                        doc_content = fetch_feishu_document(feishu_doc)
+                        if doc_content:
+                            parts = re.split(r"\n\s*\n+", doc_content.strip())
+                            feishu_reqs = [p for p in parts 
+                                         if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                            reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                            st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                except Exception as e:
+                    st.error(f"飞书文档读取失败: {e}")
+                                            st.success(f"已导入 {len(df_reqs)} 条需求")
+                                    
+                                    elif lname.endswith('.docx'):
+                                        doc = Document(file)
+                                        word_reqs = [p.text.strip() for p in doc.paragraphs 
+                                                if len(p.text.strip()) > MIN_PARAGRAPH_LENGTH]
+                                        if word_reqs:
+                                            for req in word_reqs:
+                                                st.session_state.collected_requirements.append({
+                                                    "需求编号": "",
+                                                    "需求描述": req.strip(),
+                                                    "来源": f"Word-{file.name}"
+                                                })
+                                            st.session_state.source_counts.append(
+                                                f"Word-{file.name}:{len(word_reqs)}")
+                                            st.success(f"已导入 {len(word_reqs)} 条需求")
+                                    
+                                    elif lname.endswith('.pdf'):
+                                        bytes_data = file.getvalue()
+                                        pdf_reader = PyPDF2.PdfReader(BytesIO(bytes_data))
+                                        pdf_reqs = []
+                                        for page in pdf_reader.pages:
+                                            text = page.extract_text()
+                                            parts = re.split(r"\n\s*\n+", text.strip())
+                                            pdf_reqs.extend([p for p in parts 
+                                                        if len(p.strip()) > MIN_PARAGRAPH_LENGTH])
+                                        if pdf_reqs:
+                                            for req in pdf_reqs:
+                                                st.session_state.collected_requirements.append({
+                                                    "需求编号": "",
+                                                    "需求描述": req.strip(),
+                                                    "来源": f"PDF-{file.name}"
+                                                })
+                                            st.session_state.source_counts.append(
+                                                f"PDF-{file.name}:{len(pdf_reqs)}")
+                                            st.success(f"已导入 {len(pdf_reqs)} 条需求")
+                                    
+                                    elif lname.endswith(('.txt', '.csv')):
+                                        stringio = StringIO(file.getvalue().decode("utf-8"))
+                                        lines = [l.strip() for l in stringio.readlines() 
+                                               if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                                        if lines:
+                                            for req in lines:
+                                                st.session_state.collected_requirements.append({
+                                                    "需求编号": "",
+                                                    "需求描述": req.strip(),
+                                                    "来源": f"Text-{file.name}"
+                                                })
+                                            st.session_state.source_counts.append(
+                                                f"Text-{file.name}:{len(lines)}")
+                                            st.success(f"已导入 {len(lines)} 条需求")
+                            except Exception as e:
+                                st.error(f"处理文件 {file.name} 失败: {e}")
+                except Exception as e:
+                    st.error(f"文件上传处理过程中出现错误: {e}")
+                return
+
+            handle_file_uploads()
+                
+                if st.button("开始批量生成", type="primary"):
+                    try:
+                        progress_bar = progress_ph.progress(0)
+                        result_ph.info("正在生成...")
+                        
+                        # 创建处理器
+                        processor = BatchProcessor(
+                            model=model,
+                            base_url=base_url,
+                            headers=headers,
+                            pos_n=pos_n,
+                            neg_n=neg_n,
+                            edge_n=edge_n,
+                            temperature=temperature,
+                            max_workers=parallel,
+                            background_knowledge=st.session_state.get('background_knowledge'),
+                            dynamic_mode=auto_mode,
+                            dynamic_params=dyn_params
+                        )
+                        
+                        # 准备需求列表
+                        req_list = reqmgr.get_requirements_for_batch()
+                        
+                        # 执行生成
+                        df_result = processor.process_batch(req_list)
+                        progress_bar.progress(100)
+                        
+                        if df_result is not None and not df_result.empty:
+                            result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                            st.dataframe(df_result, use_container_width=True)
+                            
+                            # 准备下载
+                            excel_data = BytesIO()
+                            with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                df_result.to_excel(writer, index=False)
+                            excel_data.seek(0)
+                            
+                            # 下载按钮
+                            st.download_button(
+                                "📥 下载 Excel",
+                                data=excel_data,
+                                file_name="测试用例_批量.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                            
+                            st.download_button(
+                                "📥 下载 CSV",
+                                data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                file_name="测试用例_批量.csv",
+                                mime="text/csv"
+                            )
+                            
+                            # 错误信息
+                            errors = processor.get_errors()
+                            if errors:
+                                with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                    for req_id, error in errors:
+                                        st.error(f"{req_id}: {error}")
+                        else:
+                            result_ph.error("生成失败，未获得有效结果")
+                            
+                    except Exception as e:
+                        progress_ph.empty()
+                        result_ph.error(f"批量生成失败: {e}")
+            else:
+                st.warning("请先添加需求")
+        
+        # 创建左右两列布局
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### 需求输入")
+            render_batch_input()
+        with col2:
+            st.markdown("### 需求预览与生成")
+            render_batch_preview()
+        try:
+            # 导入必要的模块
+            import requirements_manager as reqmgr
+            import pandas as pd
+            from docx import Document
+            import PyPDF2
+            from io import BytesIO, StringIO
+            import re
+            
+            # 创建左右两列布局
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 需求输入")
+                
+                # 清空按钮
+                if st.button("🗑️ 清空所有需求"):
+                    reqmgr.clear_requirements()
+                    st.success("已清空所有需求")
+                
+                # 1. 飞书文档输入
+                feishu_doc = st.text_input("飞书文档链接或ID", 
+                                         placeholder="输入飞书文档链接或ID")
+                if feishu_doc:
+                    try:
+                        with st.spinner("正在读取飞书文档..."):
+                            doc_content = fetch_feishu_document(feishu_doc)
+                            if doc_content:
+                                parts = re.split(r"\n\s*\n+", doc_content.strip())
+                                feishu_reqs = [p for p in parts 
+                                             if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                                st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                    except Exception as e:
+                        st.error(f"飞书文档读取失败: {e}")
+                
+                # 2. 文件上传
+                uploaded_files = st.file_uploader(
+                    "上传需求文件",
+                    type=["xlsx", "docx", "pdf", "txt", "csv"],
+                    accept_multiple_files=True
+                )
+                
+                if uploaded_files:
+                    for file in uploaded_files:
+                        try:
+                            with st.spinner(f"正在处理 {file.name}..."):
+                                if file.name.lower().endswith('.xlsx'):
+                                    df = pd.read_excel(file)
+                                    df_reqs = df['需求描述'].dropna().tolist()
+                                    if df_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            df_reqs, 
+                                            f"Excel-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(df_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.docx'):
+                                    doc = Document(file)
+                                    word_reqs = [p.text.strip() for p in doc.paragraphs 
+                                               if len(p.text.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    if word_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            word_reqs,
+                                            f"Word-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(word_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.pdf'):
+                                    bytes_data = file.getvalue()
+                                    pdf_reader = PyPDF2.PdfReader(BytesIO(bytes_data))
+                                    pdf_reqs = []
+                                    for page in pdf_reader.pages:
+                                        text = page.extract_text()
+                                        parts = re.split(r"\n\s*\n+", text.strip())
+                                        pdf_reqs.extend([p for p in parts 
+                                                       if len(p.strip()) > MIN_PARAGRAPH_LENGTH])
+                                    if pdf_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            pdf_reqs,
+                                            f"PDF-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(pdf_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith(('.txt', '.csv')):
+                                    stringio = StringIO(file.getvalue().decode("utf-8"))
+                                    lines = [l.strip() for l in stringio.readlines() 
+                                           if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    if lines:
+                                        reqmgr.add_requirements_batch(
+                                            lines,
+                                            f"Text-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(lines)} 条需求")
+                        except Exception as e:
+                            st.error(f"处理文件 {file.name} 失败: {e}")
+                
+                # 3. 手动输入
+                manual_reqs = st.text_area(
+                    "直接输入需求（每行一条）",
+                    placeholder="需求1\n需求2\n需求3...",
+                    height=150
+                )
+                
+                if st.button("添加手工输入"):
+                    if manual_reqs:
+                        lines = [l.strip() for l in manual_reqs.splitlines() 
+                                if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                        if lines:
+                            reqmgr.add_requirements_batch(lines, "手工输入")
+                            st.success(f"已添加 {len(lines)} 条需求")
+                    else:
+                        st.warning("请输入需求内容")
+            
+            with col2:
+                st.markdown("### 需求预览与生成")
+                
+                # 获取去重需求
+                unique_reqs = reqmgr.get_unique_requirements()
+                
+                # 显示统计信息
+                source_summary = reqmgr.get_source_summary()
+                if source_summary:
+                    st.info(f"数据来源: {source_summary}")
+                    st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+                # 预览表格
+                if unique_reqs:
+                    preview_df = pd.DataFrame(unique_reqs)
+                    st.dataframe(preview_df, use_container_width=True)
+                    
+                    st.divider()
+                    st.markdown("### 生成设置")
+                    
+                    parallel = st.number_input("并行处理数", 1, 8, 4)
+                    progress_ph = st.empty()
+                    result_ph = st.empty()
+                    
+                    if st.button("开始批量生成", type="primary"):
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 创建处理器
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 准备需求列表
+                            req_list = reqmgr.get_requirements_for_batch()
+                            
+                            # 执行生成
+                            df_result = processor.process_batch(req_list)
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 准备下载
+                                excel_data = BytesIO()
+                                with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                    df_result.to_excel(writer, index=False)
+                                excel_data.seek(0)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=excel_data,
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                                
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+                else:
+                    st.warning("请先添加需求")
+        except Exception as e:
+            st.error(f"页面渲染错误: {e}")
+        try:
+            import requirements_manager as reqmgr
+            
+            # 初始化全局变量
+            collected = []
+            source_counts = []
+            
+            # 创建左右两列布局
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 需求输入")
+                
+                # 清空按钮
+                if st.button("🗑️ 清空所有需求"):
+                    reqmgr.clear_requirements()
+                    st.success("已清空所有需求")
+                
+                # 1. 飞书文档输入
+                feishu_doc = st.text_input("飞书文档链接或ID", 
+                                         placeholder="输入飞书文档链接或ID")
+                if feishu_doc:
+                    try:
+                        with st.spinner("正在读取飞书文档..."):
+                            doc_content = fetch_feishu_document(feishu_doc)
+                            if doc_content:
+                                parts = re.split(r"\n\s*\n+", doc_content.strip())
+                                feishu_reqs = [p for p in parts 
+                                             if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                                st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                    except Exception as e:
+                        st.error(f"飞书文档读取失败: {e}")
+                
+                # 2. 文件上传
+                uploaded_files = st.file_uploader(
+                    "上传需求文件",
+                    type=["xlsx", "docx", "pdf", "txt", "csv"],
+                    accept_multiple_files=True
+                )
+                
+                if uploaded_files:
+                    for file in uploaded_files:
+                        try:
+                            with st.spinner(f"正在处理 {file.name}..."):
+                                if file.name.lower().endswith('.xlsx'):
+                                    df = pd.read_excel(file)
+                                    df_reqs = df['需求描述'].dropna().tolist()
+                                    if df_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            df_reqs, 
+                                            f"Excel-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(df_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.docx'):
+                                    doc = Document(file)
+                                    word_reqs = [p.text.strip() for p in doc.paragraphs 
+                                               if len(p.text.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    if word_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            word_reqs,
+                                            f"Word-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(word_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith('.pdf'):
+                                    bytes_data = file.getvalue()
+                                    pdf_reader = PyPDF2.PdfReader(BytesIO(bytes_data))
+                                    pdf_reqs = []
+                                    for page in pdf_reader.pages:
+                                        text = page.extract_text()
+                                        parts = re.split(r"\n\s*\n+", text.strip())
+                                        pdf_reqs.extend([p for p in parts 
+                                                       if len(p.strip()) > MIN_PARAGRAPH_LENGTH])
+                                    if pdf_reqs:
+                                        reqmgr.add_requirements_batch(
+                                            pdf_reqs,
+                                            f"PDF-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(pdf_reqs)} 条需求")
+                                
+                                elif file.name.lower().endswith(('.txt', '.csv')):
+                                    stringio = StringIO(file.getvalue().decode("utf-8"))
+                                    lines = [l.strip() for l in stringio.readlines() 
+                                           if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    if lines:
+                                        reqmgr.add_requirements_batch(
+                                            lines,
+                                            f"Text-{file.name}"
+                                        )
+                                        st.success(f"已导入 {len(lines)} 条需求")
+                        
+                        except Exception as e:
+                            st.error(f"处理文件 {file.name} 失败: {e}")
+                
+                # 3. 手动输入
+                manual_reqs = st.text_area(
+                    "直接输入需求（每行一条）",
+                    placeholder="需求1\n需求2\n需求3...",
+                    height=150
+                )
+                
+                if st.button("添加手工输入"):
+                    if manual_reqs:
+                        lines = [l.strip() for l in manual_reqs.splitlines() 
+                                if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                        if lines:
+                            reqmgr.add_requirements_batch(lines, "手工输入")
+                            st.success(f"已添加 {len(lines)} 条需求")
+                    else:
+                        st.warning("请输入需求内容")
+            
+            with col2:
+                st.markdown("### 需求预览与生成")
+                
+                # 获取去重需求
+                unique_reqs = reqmgr.get_unique_requirements()
+                
+                # 显示统计信息
+                source_summary = reqmgr.get_source_summary()
+                if source_summary:
+                    st.info(f"数据来源: {source_summary}")
+                    st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+                # 预览表格
+                if unique_reqs:
+                    preview_df = pd.DataFrame(unique_reqs)
+                    st.dataframe(preview_df, use_container_width=True)
+                    
+                    st.divider()
+                    st.markdown("### 生成设置")
+                    
+                    parallel = st.number_input("并行处理数", 1, 8, 4)
+                    progress_ph = st.empty()
+                    result_ph = st.empty()
+                    
+                    if st.button("开始批量生成", type="primary"):
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 创建处理器
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 准备需求列表
+                            req_list = reqmgr.get_requirements_for_batch()
+                            
+                            # 执行生成
+                            df_result = processor.process_batch(req_list)
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 准备下载
+                                excel_data = BytesIO()
+                                with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                    df_result.to_excel(writer, index=False)
+                                excel_data.seek(0)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=excel_data,
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                                
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+                else:
+                    st.warning("请先添加需求")
+        except Exception as e:
+            st.error(f"页面渲染错误: {e}")
+        import requirements_manager as reqmgr
+        
+        # 初始化全局变量
+        collected = []
+        source_counts = []
+        
+        try:
+            # 创建左右两列布局
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 需求输入")
+                
+                # 清空按钮
+                if st.button("🗑️ 清空所有需求"):
+                    reqmgr.clear_requirements()
+                    st.success("已清空所有需求")
+                
+                # 1. 飞书文档输入
+                feishu_doc = st.text_input("飞书文档链接或ID", 
+                                         placeholder="输入飞书文档链接或ID")
+                if feishu_doc:
+                    try:
+                        with st.spinner("正在读取飞书文档..."):
+                            doc_content = fetch_feishu_document(feishu_doc)
+                            if doc_content:
+                                parts = re.split(r"\n\s*\n+", doc_content.strip())
+                                feishu_reqs = [p for p in parts 
+                                             if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                                st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                    except Exception as e:
+                        st.error(f"飞书文档读取失败: {e}")
+                
+                # 2. 文件上传
+                uploaded_files = st.file_uploader(
+                    "上传需求文件",
+                    type=["xlsx", "docx", "pdf", "txt", "csv"],
+                    accept_multiple_files=True
+                )
+                
+                if uploaded_files:
+                    for file in uploaded_files:
+                        try:
+                            with st.spinner(f"正在处理 {file.name}..."):
+                                if file.name.lower().endswith('.xlsx'):
+                                    _process_excel_file(file)
+                                elif file.name.lower().endswith('.docx'):
+                                    _process_word_file(file)
+                                elif file.name.lower().endswith('.pdf'):
+                                    _process_pdf_file(file)
+                                elif file.name.lower().endswith(('.txt', '.csv')):
+                                    _process_text_file(file)
+                        except Exception as e:
+                            st.error(f"处理文件 {file.name} 失败: {e}")
+                
+                # 3. 手动输入
+                manual_reqs = st.text_area(
+                    "直接输入需求（每行一条）",
+                    placeholder="需求1\n需求2\n需求3...",
+                    height=150
+                )
+                
+                if st.button("添加手工输入"):
+                    if manual_reqs:
+                        lines = [l.strip() for l in manual_reqs.splitlines() 
+                                if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                        if lines:
+                            reqmgr.add_requirements_batch(lines, "手工输入")
+                            st.success(f"已添加 {len(lines)} 条需求")
+                    else:
+                        st.warning("请输入需求内容")
+            
+            with col2:
+                st.markdown("### 需求预览与生成")
+                
+                # 获取去重需求
+                unique_reqs = reqmgr.get_unique_requirements()
+                
+                # 显示统计信息
+                source_summary = reqmgr.get_source_summary()
+                if source_summary:
+                    st.info(f"数据来源: {source_summary}")
+                    st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+                # 预览表格
+                if unique_reqs:
+                    preview_df = pd.DataFrame(unique_reqs)
+                    st.dataframe(preview_df, use_container_width=True)
+                    
+                    st.divider()
+                    st.markdown("### 生成设置")
+                    
+                    parallel = st.number_input("并行处理数", 1, 8, 4)
+                    progress_ph = st.empty()
+                    result_ph = st.empty()
+                    
+                    if st.button("开始批量生成", type="primary"):
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 创建处理器
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 准备需求列表
+                            req_list = reqmgr.get_requirements_for_batch()
+                            
+                            # 执行生成
+                            df_result = processor.process_batch(req_list)
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 准备下载
+                                excel_data = BytesIO()
+                                with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                    df_result.to_excel(writer, index=False)
+                                excel_data.seek(0)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=excel_data,
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                                
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+                else:
+                    st.warning("请先添加需求")
+        except Exception as e:
+            st.error(f"页面渲染错误: {e}")
+        import requirements_manager as reqmgr
+        
+        try:
+            # 创建左右两列布局
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 需求输入")
+                
+                # 清空按钮
+                if st.button("🗑️ 清空所有需求"):
+                    reqmgr.clear_requirements()
+                    st.success("已清空所有需求")
+                
+                # 1. 飞书文档输入
+                feishu_doc = st.text_input("飞书文档链接或ID", 
+                                         placeholder="输入飞书文档链接或ID")
+                if feishu_doc:
+                    try:
+                        with st.spinner("正在读取飞书文档..."):
+                            doc_content = fetch_feishu_document(feishu_doc)
+                            if doc_content:
+                                parts = re.split(r"\n\s*\n+", doc_content.strip())
+                                feishu_reqs = [p for p in parts 
+                                             if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                                st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                    except Exception as e:
+                        st.error(f"飞书文档读取失败: {e}")
+                
+                # 2. 文件上传
+                uploaded_files = st.file_uploader(
+                    "上传需求文件",
+                    type=["xlsx", "docx", "pdf", "txt", "csv"],
+                    accept_multiple_files=True
+                )
+                
+                if uploaded_files:
+                    for file in uploaded_files:
+                        try:
+                            with st.spinner(f"正在处理 {file.name}..."):
+                                if file.name.lower().endswith('.xlsx'):
+                                    _process_excel_file(file)
+                                elif file.name.lower().endswith('.docx'):
+                                    _process_word_file(file)
+                                elif file.name.lower().endswith('.pdf'):
+                                    _process_pdf_file(file)
+                                elif file.name.lower().endswith(('.txt', '.csv')):
+                                    _process_text_file(file)
+                        except Exception as e:
+                            st.error(f"处理文件 {file.name} 失败: {e}")
+                
+                # 3. 手动输入
+                manual_reqs = st.text_area(
+                    "直接输入需求（每行一条）",
+                    placeholder="需求1\n需求2\n需求3...",
+                    height=150
+                )
+                
+                if st.button("添加手工输入"):
+                    if manual_reqs:
+                        lines = [l.strip() for l in manual_reqs.splitlines() 
+                                if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                        if lines:
+                            reqmgr.add_requirements_batch(lines, "手工输入")
+                            st.success(f"已添加 {len(lines)} 条需求")
+                    else:
+                        st.warning("请输入需求内容")
+            
+            with col2:
+                st.markdown("### 需求预览与生成")
+                
+                # 获取去重需求
+                unique_reqs = reqmgr.get_unique_requirements()
+                
+                # 显示统计信息
+                source_summary = reqmgr.get_source_summary()
+                if source_summary:
+                    st.info(f"数据来源: {source_summary}")
+                    st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+                # 预览表格
+                if unique_reqs:
+                    preview_df = pd.DataFrame(unique_reqs)
+                    st.dataframe(preview_df, use_container_width=True)
+                    
+                    st.divider()
+                    st.markdown("### 生成设置")
+                    
+                    parallel = st.number_input("并行处理数", 1, 8, 4)
+                    progress_ph = st.empty()
+                    result_ph = st.empty()
+                    
+                    if st.button("开始批量生成", type="primary"):
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 创建处理器
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 准备需求列表
+                            req_list = reqmgr.get_requirements_for_batch()
+                            
+                            # 执行生成
+                            df_result = processor.process_batch(req_list)
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 准备下载
+                                excel_data = BytesIO()
+                                with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                    df_result.to_excel(writer, index=False)
+                                excel_data.seek(0)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=excel_data,
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                                
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+                else:
+                    st.warning("请先添加需求")
+        except Exception as e:
+            st.error(f"页面渲染错误: {e}")
+    
+    if st.button("添加手工输入"):
+        if manual_reqs:
+            lines = [l.strip() for l in manual_reqs.splitlines() 
+                    if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+            if lines:
+                for line in lines:
+                    st.session_state.collected_requirements.append({
+                        "需求编号": "",
+                        "需求描述": line,
+                        "来源": "手工输入"
+                    })
+                st.session_state.source_counts.append(f"手工:{len(lines)}")
+                st.success(f"已添加 {len(lines)} 条需求")
+        else:
+            st.warning("请输入需求内容")
+            st.warning("请输入需求内容")
+
+def render_manual_input(ctx: Dict[str, Any]) -> None:
+    """渲染手动输入界面
+    
+    Args:
+        ctx: 上下文参数字典,包含:
+            reqmgr: 需求管理器实例
+    """
+    import streamlit as st
+    
+    st.markdown("### 需求分析")
+    
+    # 选择需求进行分析
+    reqs = ctx['reqmgr'].get_unique_requirements()
+    if not reqs:
+        st.info("请先导入或输入需求")
+        return
+        
+    selected = st.selectbox(
+        "选择需求进行分析",
+        reqs,
+        format_func=lambda x: f"{x[:100]}..." if len(x) > 100 else x
+    )
+    
+    if selected:
+        # 显示需求详情
+        st.markdown("##### 需求详情")
+        st.text_area(
+            "需求描述",
+            value=selected,
+            height=100,
+            disabled=True
+        )
+        
+        sources = ctx['reqmgr'].get_requirement_sources(selected)
+        if sources:
+            st.markdown(f"**来源**: {', '.join(sources)}")
+            
+        # 生成测试用例
+        if st.button("生成测试用例"):
+            with st.spinner("正在生成测试用例..."):
+                test_cases = generate_testcases(selected)
+                if test_cases:
+                    ctx['reqmgr'].add_testcases(selected, test_cases)
+                    st.success("测试用例生成完成")
+                else:
+                    st.error("测试用例生成失败")
+
+def render_testcase_preview(ctx: Dict[str, Any]) -> None:
+    """渲染测试用例预览界面
+    
+    Args:
+        ctx: 上下文参数字典,包含:
+            reqmgr: 需求管理器实例
+    """
+    import streamlit as st
+    import pandas as pd
+    
+    st.markdown("### 测试用例预览")
+    
+    # 获取所有测试用例
+    all_cases = ctx['reqmgr'].get_all_testcases()
+    if not all_cases:
+        st.info("暂无测试用例")
+        return
+        
+    # 构建预览数据
+    preview_data = []
+    for req, cases in all_cases.items():
+        for case in cases:
+            preview_data.append({
+                "需求": req[:100] + "..." if len(req) > 100 else req,
+                "用例标题": case.get("title", ""),
+                "优先级": case.get("priority", ""),
+                "前置条件": case.get("precondition", ""),
+                "测试步骤": case.get("steps", ""),
+                "预期结果": case.get("expected", "")
+            })
+    
+    # 显示测试用例表格
+    df = pd.DataFrame(preview_data)
+    st.dataframe(df, use_container_width=True)
+
+def render_dashboard(ctx: Dict[str, Any]) -> None:
+    """渲染统计看板界面
+    
+    Args:
+        ctx: 上下文参数字典,包含:
+            reqmgr: 需求管理器实例
+    """
+    import streamlit as st
+    import plotly.express as px
+    import pandas as pd
+    
+    st.markdown("### 需求分析看板")
+    
+    # 1. 需求总览
+    reqs = ctx['reqmgr'].get_unique_requirements()
+    if not reqs:
+        st.info("暂无需求数据")
+        return
+        
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("总需求数", len(reqs))
+    with col2:
+        all_cases = ctx['reqmgr'].get_all_testcases()
+        total_cases = sum(len(cases) for cases in all_cases.values())
+        st.metric("总用例数", total_cases)
+    with col3:
+        coverage = round(100 * len(all_cases) / len(reqs), 1) if reqs else 0
+        st.metric("需求覆盖率", f"{coverage}%")
+    
+    # 2. 需求来源分布
+    st.markdown("#### 需求来源分布")
+    source_counts = []
+    for req in reqs:
+        sources = ctx['reqmgr'].get_requirement_sources(req)
+        for source in sources:
+            source_counts.append({"来源": source, "数量": 1})
+    
+    if source_counts:
+        df = pd.DataFrame(source_counts)
+        fig = px.pie(
+            df,
+            values="数量",
+            names="来源",
+            title="需求来源分布"
+        )
+        st.plotly_chart(fig)
+
+def render_batch_preview(ctx: Dict[str, Any]) -> None:
+    """渲染批量需求预览界面
+    
+    Args:
+        ctx: 上下文参数字典,包含:
+            reqmgr: 需求管理器实例
+    """
+    import streamlit as st
+    import pandas as pd
+    
+    # 显示需求统计
+    reqs = ctx['reqmgr'].get_unique_requirements()
+    if not reqs:
+        st.info("暂无需求记录")
+        return
+        
+    st.write(f"当前共有 {len(reqs)} 条独特需求")
+    
+    # 构建预览表格
+    preview_data = []
+    for req in reqs:
+        sources = ctx['reqmgr'].get_requirement_sources(req)
+        preview_data.append({
+            "需求": req,
+            "来源": ", ".join(sources)
+        })
+    
+    # 显示预览表格
+    df = pd.DataFrame(preview_data)
+    st.dataframe(df, use_container_width=True)
+    """渲染需求预览和生成界面
+
+    Args:
+        ctx: 上下文参数字典，包含:
+            model: 使用的模型名称
+            base_url: API基础URL
+            headers: 输出表格的列名
+            pos_n: 正向用例数
+            neg_n: 异常用例数
+            edge_n: 边界用例数
+            temperature: 模型温度参数
+            auto_mode: 是否启用动态分配模式
+            dyn_params: 动态参数
+            reqmgr: 需求管理器实例
+    """
+    import streamlit as st
+    import pandas as pd
+    from io import BytesIO
+    from test_batch import BatchProcessor
+    
+    # 获取去重需求
+    unique_reqs = ctx['reqmgr'].get_unique_requirements()
+    
+    # 显示统计信息
+    source_summary = ctx['reqmgr'].get_source_summary()
+    if source_summary:
+        st.info(f"数据来源: {source_summary}")
+        st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+    
+    # 预览表格
+    if unique_reqs:
+        preview_df = pd.DataFrame(unique_reqs)
+        st.dataframe(preview_df, use_container_width=True)
+        
+        st.divider()
+        st.markdown("### 生成设置")
+        
+        parallel = st.number_input("并行处理数", 1, 8, 4)
+        progress_ph = st.empty()
+        result_ph = st.empty()
+        
+        if st.button("开始批量生成", type="primary"):
+            try:
+                progress_bar = progress_ph.progress(0)
+                result_ph.info("正在生成...")
+                
+                # 创建处理器
+                processor = BatchProcessor(
+                    model=ctx['model'],
+                    base_url=ctx['base_url'],
+                    headers=ctx['headers'],
+                    pos_n=ctx['pos_n'],
+                    neg_n=ctx['neg_n'],
+                    edge_n=ctx['edge_n'],
+                    temperature=ctx['temperature'],
+                    max_workers=parallel,
+                    background_knowledge=st.session_state.get('background_knowledge'),
+                    dynamic_mode=ctx['auto_mode'],
+                    dynamic_params=ctx['dyn_params']
+                )
+                
+                # 准备需求列表
+                req_list = ctx['reqmgr'].get_requirements_for_batch()
+                
+                # 执行生成
+                df_result = processor.process_batch(req_list)
+                progress_bar.progress(100)
+                
+                if df_result is not None and not df_result.empty:
+                    result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                    st.dataframe(df_result, use_container_width=True)
+                    
+                    # 准备下载
+                    excel_data = BytesIO()
+                    with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                        df_result.to_excel(writer, index=False)
+                    excel_data.seek(0)
+                    
+                    # 下载按钮
+                    st.download_button(
+                        "📥 下载 Excel",
+                        data=excel_data,
+                        file_name="测试用例_批量.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    
+                    st.download_button(
+                        "📥 下载 CSV",
+                        data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                        file_name="测试用例_批量.csv",
+                        mime="text/csv"
+                    )
+                    
+                    # 错误信息
+                    errors = processor.get_errors()
+                    if errors:
+                        with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                            for req_id, error in errors:
+                                st.error(f"{req_id}: {error}")
+                else:
+                    result_ph.error("生成失败，未获得有效结果")
+                    
+            except Exception as e:
+                progress_ph.empty()
+                result_ph.error(f"批量生成失败: {e}")
+    else:
+        st.warning("请先添加需求")
+    # 获取去重需求
+    unique_reqs = []
+    seen = set()
+    for req in st.session_state.collected_requirements:
+        key = req["需求描述"].strip()
+        if key and key not in seen:
+            seen.add(key)
+            if not req["需求编号"]:
+                req["需求编号"] = f"REQ-{len(unique_reqs)+1:03d}"
+            unique_reqs.append(req)
+    
+    # 显示统计信息
+    if st.session_state.source_counts:
+        st.info(f"数据来源: {' | '.join(st.session_state.source_counts)}")
+        st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+    
+    # 预览表格
+    if unique_reqs:
+        preview_df = pd.DataFrame(unique_reqs)
+        st.dataframe(preview_df, use_container_width=True)
+        
+        st.divider()
+        st.markdown("### 生成设置")
+        
+        parallel = st.number_input("并行处理数", 1, 8, 4)
+        progress_ph = st.empty()
+        result_ph = st.empty()
+        
+        if st.button("开始批量生成", type="primary"):
+            try:
+                # 准备生成
+                progress_bar = progress_ph.progress(0)
+                result_ph.info("正在生成...")
+                
+                # 创建处理器
+                processor = BatchProcessor(
+                    model=model,
+                    base_url=base_url,
+                    headers=headers,
+                    pos_n=pos_n,
+                    neg_n=neg_n,
+                    edge_n=edge_n,
+                    temperature=temperature,
+                    max_workers=parallel,
+                    background_knowledge=st.session_state.get('background_knowledge'),
+                    dynamic_mode=auto_mode,
+                    dynamic_params=dyn_params
+                )
+                
+                # 准备需求列表
+                req_list = [(r["需求描述"], r["需求编号"]) for r in unique_reqs]
+                
+                # 执行生成
+                df_result = processor.process_batch(req_list)
+                progress_bar.progress(100)
+                
+                if df_result is not None and not df_result.empty:
+                    result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                    st.dataframe(df_result, use_container_width=True)
+                    
+                    # 准备下载
+                    excel_data = BytesIO()
+                    with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                        df_result.to_excel(writer, index=False)
+                    excel_data.seek(0)
+                    
+                    # 下载按钮
+                    st.download_button(
+                        "📥 下载 Excel",
+                        data=excel_data,
+                        file_name="测试用例_批量.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    
+                    st.download_button(
+                        "📥 下载 CSV",
+                        data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                        file_name="测试用例_批量.csv",
+                        mime="text/csv"
+                    )
+                    
+                    # 错误信息
+                    errors = processor.get_errors()
+                    if errors:
+                        with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                            for req_id, error in errors:
+                                st.error(f"{req_id}: {error}")
+                else:
+                    result_ph.error("生成失败，未获得有效结果")
+                    
+            except Exception as e:
+                progress_ph.empty()
+                result_ph.error(f"批量生成失败: {e}")
+    else:
+        st.warning("请先添加需求")
+        
+        # 创建左右两列布局
+        col1, col2 = st.columns(2)
+        
+        # 渲染两个主要部分
+        with col1:
+            st.markdown("### 需求输入")
+            render_batch_input()
+            
+        with col2:
+            st.markdown("### 需求预览与生成")
+            render_batch_preview()
+        
+        with col1:
+            st.markdown("### 需求输入")
+            
+            # 清空按钮
+            if st.button("🗑️ 清空所有需求"):
+                reqmgr.clear_requirements()
+                st.success("已清空所有需求")
+            
+            # 1. 飞书文档输入
+            feishu_doc = st.text_input("飞书文档链接或ID", placeholder="输入飞书文档链接或ID")
+            if feishu_doc:
+                with st.spinner("正在读取飞书文档..."):
+                    try:
+                        doc_content = fetch_feishu_document(feishu_doc)
+                        if doc_content:
+                            parts = re.split(r"\n\s*\n+", doc_content.strip())
+                            feishu_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                            reqmgr.add_requirements_batch(feishu_reqs, "飞书文档")
+                            st.success(f"已导入 {len(feishu_reqs)} 条需求")
+                    except Exception as e:
+                        st.error(f"飞书文档读取失败: {e}")
+                            
+            # 2. 文件上传
+            uploaded_files = st.file_uploader("上传需求文件", 
+                                           type=["xlsx", "docx", "pdf", "txt", "csv"],
+                                           accept_multiple_files=True)
+            if uploaded_files:
+                for file in uploaded_files:
+                    try:
+                        lname = file.name.lower()
+                        with st.spinner(f"正在处理 {file.name}..."):
+                            if lname.endswith('.xlsx'):
+                                sheets = read_excel(file)
+                                if sheets:
+                                    for sheet_name, df in sheets.items():
+                                        for col in df.columns:
+                                            rows = df[col].dropna().astype(str).str.strip()
+                                            df_reqs = [r for r in rows if len(r.strip()) > MIN_PARAGRAPH_LENGTH]
+                                            reqmgr.add_requirements_batch(df_reqs, f"Excel-{file.name}")
+                            elif lname.endswith('.docx'):
+                                content = read_word(file)
+                                if content:
+                                    parts = re.split(r"\n\s*\n+", content.strip())
+                                    word_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    reqmgr.add_requirements_batch(word_reqs, f"Word-{file.name}")
+                            elif lname.endswith('.pdf'):
+                                content = read_background_doc(file)
+                                if content:
+                                    parts = re.split(r"\n\s*\n+", content.strip())
+                                    pdf_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
+                                    reqmgr.add_requirements_batch(pdf_reqs, f"PDF-{file.name}")
+                            elif lname.endswith(('.txt', '.csv')):
+                                text = file.getvalue().decode('utf-8')
+                                lines = [l for l in text.splitlines() if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                                reqmgr.add_requirements_batch(lines, f"Text-{file.name}")
+                    except Exception as e:
+                        st.error(f"处理文件 {file.name} 失败: {e}")
+                        
+            # 3. 直接粘贴需求文本
+            manual_reqs = st.text_area("直接输入需求（每行一条）", 
+                                     placeholder="需求1\n需求2\n需求3...",
+                                     height=150)
+            if st.button("添加手工输入"):
+                if manual_reqs:
+                    lines = [l for l in manual_reqs.splitlines() if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+                    if lines:
+                        reqmgr.add_requirements_batch(lines, "手工输入")
+                        st.success(f"已添加 {len(lines)} 条需求")
+                else:
+                    st.warning("请输入需求内容")
+                    
+        with col2:
+            st.markdown("### 需求预览与生成")
+            
+            # 获取去重后的需求
+            unique_reqs = reqmgr.get_unique_requirements()
+            
+            # 显示来源统计
+            source_summary = reqmgr.get_source_summary()
+            if source_summary:
+                st.info(f"数据来源: {source_summary}")
+                st.info(f"去重后总计: {len(unique_reqs)} 条需求")
+                
+            # 需求预览表格
+            if unique_reqs:
+                preview_df = pd.DataFrame(unique_reqs)
+                st.dataframe(preview_df, use_container_width=True)
+                
+                # 生成控制参数
+                st.divider()
+                st.markdown("### 生成设置")
+                parallel = st.number_input("并行处理数", 1, 8, 4)
+                
+                # 生成进度指示器
+                progress_ph = st.empty()
+                result_ph = st.empty()
+                
+                if st.button("开始批量生成", type="primary"):
+                    try:
+                        progress_bar = progress_ph.progress(0)
+                        result_ph.info("正在生成...")
+                        
+                        # 准备需求列表
+                        req_list = reqmgr.get_requirements_for_batch()
+                        
+                        # 创建处理器
+                        from test_batch import BatchProcessor
+                        processor = BatchProcessor(
+                            model=model,
+                            base_url=base_url,
+                            headers=headers,
+                            pos_n=pos_n,
+                            neg_n=neg_n,
+                            edge_n=edge_n,
+                            temperature=temperature,
+                            max_workers=parallel,
+                            background_knowledge=st.session_state.get('background_knowledge'),
+                            dynamic_mode=auto_mode,
+                            dynamic_params=dyn_params
+                        )
+                        
+                        # 启动批处理
+                        df_result = processor.process_batch(req_list)
+                        
+                        # 更新进度
+                        progress_bar.progress(100)
+                        
+                        if df_result is not None and not df_result.empty:
+                            result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                            
+                            # 显示结果
+                            st.dataframe(df_result, use_container_width=True)
+                            
+                            # 下载按钮
+                            excel_data = BytesIO()
+                            with pd.ExcelWriter(excel_data, engine='openpyxl') as writer:
+                                df_result.to_excel(writer, index=False)
+                            excel_data.seek(0)
+                            
+                            st.download_button(
+                                "📥 下载 Excel",
+                                data=excel_data,
+                                file_name="测试用例_批量.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                            
+                            st.download_button(
+                                "📥 下载 CSV",
+                                data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                file_name="测试用例_批量.csv",
+                                mime="text/csv"
+                            )
+                            
+                            # 显示错误信息
+                            errors = processor.get_errors()
+                            if errors:
+                                with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                    for req_id, error in errors:
+                                        st.error(f"{req_id}: {error}")
+                        else:
+                            result_ph.error("生成失败，未获得有效结果")
+                    except Exception as e:
+                        progress_ph.empty()
+                        result_ph.error(f"批量生成失败: {e}")
+            else:
+                st.warning("请先添加需求")
+                
+                # 生成控制参数
+                st.divider()
+                st.markdown("### 生成设置")
+                parallel = st.number_input("并行处理数", 1, 8, 4)
+                
+                # 生成进度指示器
+                progress_ph = st.empty()
+                result_ph = st.empty()
+                
+                if st.button("开始批量生成", type="primary"):
+                    if len(unique_reqs) == 0:
+                        st.error("没有可用的需求")
+                    else:
+                        try:
+                            progress_bar = progress_ph.progress(0)
+                            result_ph.info("正在生成...")
+                            
+                            # 准备需求列表
+                            req_list = [(r["需求描述"], r["需求编号"]) for r in unique_reqs]
+                            
+                            # 创建处理器
+                            from test_batch import BatchProcessor
+                            processor = BatchProcessor(
+                                model=model,
+                                base_url=base_url,
+                                headers=headers,
+                                pos_n=pos_n,
+                                neg_n=neg_n,
+                                edge_n=edge_n,
+                                temperature=temperature,
+                                max_workers=parallel,
+                                background_knowledge=st.session_state.get('background_knowledge'),
+                                dynamic_mode=auto_mode,
+                                dynamic_params=dyn_params
+                            )
+                            
+                            # 启动批处理
+                            df_result = processor.process_batch(req_list)
+                            
+                            # 更新进度
+                            progress_bar.progress(100)
+                            
+                            if df_result is not None and not df_result.empty:
+                                result_ph.success(f"已生成 {len(df_result)} 条测试用例")
+                                
+                                # 显示结果
+                                st.dataframe(df_result, use_container_width=True)
+                                
+                                # 下载按钮
+                                st.download_button(
+                                    "📥 下载 Excel",
+                                    data=df_result.to_excel(index=False).getvalue(),
+                                    file_name="测试用例_批量.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                                
+                                st.download_button(
+                                    "📥 下载 CSV",
+                                    data=df_result.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="测试用例_批量.csv",
+                                    mime="text/csv"
+                                )
+                                
+                                # 显示错误信息
+                                errors = processor.get_errors()
+                                if errors:
+                                    with st.expander(f"处理过程中的错误 ({len(errors)})"):
+                                        for req_id, error in errors:
+                                            st.error(f"{req_id}: {error}")
+                            else:
+                                result_ph.error("生成失败，未获得有效结果")
+                        except Exception as e:
+                            progress_ph.empty()
+                            result_ph.error(f"批量生成失败: {e}")
+            else:
+                st.warning("请先添加需求")
+                                    collected.append({"需求编号": "", "需求描述": r, "来源": "手工"})
+                                source_counts.append(f"手工:{len(manual_list)}")
+
+                        st.divider()
+                        # 额外指令输入窗口
+                        extra_cmd = st.text_area("额外指令/备注 (可选)", placeholder="如需特殊处理或补充说明，请在此输入", height=80)
+
+                        # 需求去重与预览
+                        unique_reqs = []
+                        seen = set()
+                        for r in collected:
+                            key = r["需求描述"].strip()
+                            if key not in seen:
+                                seen.add(key)
+                                unique_reqs.append(r)
+
+                        st.info(f"来源统计: {' | '.join(source_counts) if source_counts else '无'} | 合并后去重: {len(unique_reqs)} 条")
+
+                        if unique_reqs:
+                            preview_df = pd.DataFrame(unique_reqs)
+                            if "需求编号" in preview_df.columns:
+                                for i in range(len(preview_df)):
+                                    if not preview_df.at[i, "需求编号"]:
+                                        preview_df.at[i, "需求编号"] = f"REQ-{i+1:03d}"
+                            st.subheader("识别出的需求预览 (标准格式)")
+                            st.dataframe(preview_df, use_container_width=True)
+                            if extra_cmd:
+                                st.write(f"**额外指令/备注：** {extra_cmd}")
+
+                        if st.button("批量生成 (混合来源)"):
+                            if not unique_reqs:
+                                st.error("没有可用需求")
+                            else:
+                                req_list = [r["需求描述"] for r in unique_reqs]
+                                df_all = process_batch_requirements(
+                                    base_url,
+                                    req_list,
+                                    headers,
+                                    model,
+                                    pos_n,
+                                    neg_n,
+                                    edge_n,
+                                    temperature,
+                                    st.session_state.get('background_knowledge'),
+                                    dynamic=auto_mode,
+                                    dyn_params=dyn_params,
+                                )
+                                st.dataframe(df_all)
+                                make_excel_download(df_all, "测试用例_批量.xlsx")
+                                make_csv_download(df_all, "测试用例_批量.csv")
+            except Exception as e:
+                st.error(f"生成异常: {e}")
+
+        st.divider()
+        # 2. 手工文本 (一行一个需求)
+        st.markdown("**手工输入需求 (每行一个)**")
+        manual_text = st.text_area("手工需求列表", placeholder="需求1...\n需求2...", height=150)
+        if manual_text:
+            manual_list = [l.strip() for l in manual_text.splitlines() if len(l.strip()) > MIN_PARAGRAPH_LENGTH]
+            if manual_list:
+                collected.extend([(l, "Manual") for l in manual_list])
+                source_counts.append(f"手工:{len(manual_list)}")
+
+        st.divider()
+        # 3. 网页链接 -> 需求提取 (简单按段落拆分)
+        st.markdown("**网页链接 (需求来源) 每行一个 URL**")
+        url_require_text = st.text_area("需求链接列表", placeholder="https://example.com/page1\nhttps://example.com/page2", height=110, key="req_url_box")
+        fetch_req_urls = st.button("抓取链接需求")
+        if fetch_req_urls:
+            raw_urls = [u.strip() for u in url_require_text.splitlines() if u.strip()]
+            valid_urls = [u for u in raw_urls if _is_valid_url(u)]
+            fetched_req = []
+            for u in valid_urls[:6]:  # 限制 6 个避免超时
+                with st.spinner(f"抓取 {u} ..."):
+                    txt = fetch_url_content(u, max_chars=16000)
+                # 粗分段
+                segments = re.split(r"\n\s*\n+", txt)
+                seg_clean = [s.strip() for s in segments if len(s.strip()) > MIN_PARAGRAPH_LENGTH]
+                # 限制每个链接最大段数 25
+                seg_clean = seg_clean[:25]
+                if seg_clean:
+                    # store each with source indicating origin URL
+                    fetched_req.extend([(s, f"Web:{u}") for s in seg_clean])
+            if fetched_req:
+                # 存入 session，允许重复点击覆盖
+                # session stores plain strings for backward compatibility
+                st.session_state['batch_url_requirements'] = [s for s, _ in fetched_req]
+                # also append to collected with source labels
+                collected.extend(fetched_req)
+                st.success(f"链接共提取 {len(fetched_req)} 条候选需求")
+            else:
+                st.warning("未从链接中提取到有效需求")
+
+        if st.session_state.get('batch_url_requirements'):
+            url_count = len(st.session_state['batch_url_requirements'])
+            source_counts.append(f"网页:{url_count}")
+            with st.expander(f"查看链接提取需求 ({url_count})"):
+                for i, rtxt in enumerate(st.session_state['batch_url_requirements'][:50]):
+                    st.write(f"{i+1}. {rtxt[:160]}{'...' if len(rtxt)>160 else ''}")
+            # note: collected already appended when fetch button clicked; if not, append now
+            # (avoid double append)
+            # collected.extend([(r, 'Web') for r in st.session_state['batch_url_requirements'])
+
+        # 4. 外部接口导入 (URL 返回 JSON 列表或 {'requirements':[...]} )
+        st.markdown("**从外部接口导入需求 (返回 JSON 数组或 {requirements: []})**")
+        api_url = st.text_input("外部接口 URL", placeholder="https://api.example.com/requirements", key="api_import_url")
+        api_auth = st.text_input("接口认证 token (可选, 放在 Authorization: Bearer)", type="password", key="api_import_token")
+        import_api = st.button("导入外部接口需求")
+        if import_api and api_url:
+            try:
+                headers = {"User-Agent": "TestCaseGenBot/1.0"}
+                if api_auth and api_auth.strip():
+                    headers["Authorization"] = f"Bearer {api_auth.strip()}"
+                with st.spinner(f"请求 {api_url} ..."):
+                    resp = requests.get(api_url, headers=headers, timeout=15)
+                if resp.status_code != 200:
+                    st.error(f"接口返回状态: {resp.status_code}")
+                else:
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        st.error("接口返回非JSON内容，期望 JSON 数组或包含 requirements 键的对象")
+                        payload = None
+                    fetched_api = []
+                    if isinstance(payload, list):
+                        fetched_api = [str(x).strip() for x in payload if isinstance(x, str) and len(x.strip()) > MIN_PARAGRAPH_LENGTH]
+                    elif isinstance(payload, dict) and isinstance(payload.get('requirements'), list):
+                        fetched_api = [str(x).strip() for x in payload.get('requirements') if isinstance(x, str) and len(x.strip()) > MIN_PARAGRAPH_LENGTH]
+                    else:
+                        st.error("JSON 结构不符合预期：传入列表或包含 'requirements' 的对象")
+                    if fetched_api:
+                        collected.extend([(r, f"API:{api_url}") for r in fetched_api])
+                        source_counts.append(f"API:{len(fetched_api)}")
+                        st.success(f"从接口导入 {len(fetched_api)} 条需求")
+            except Exception as e:
+                st.error(f"外部接口导入失败: {e}")
+
+        # 去重 & 清理: collected contains tuples (text, source)
+        unique_reqs = []  # type: List[str]
+        dedup_records: List[Dict[str, str]] = []
+        seen = set()
+        for text, src in collected:
+            key = text.strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique_reqs.append(key)
+                dedup_records.append({
+                    "来源": src,
+                    "需求编号": extract_req_id(key) or "",
+                    "摘要": (key.splitlines()[0][:80] if key else ""),
+                    "内容": key,
+                })
+
+        st.info(f"来源统计: {' | '.join(source_counts) if source_counts else '无'} | 合并后去重: {len(unique_reqs)} 条")
+
+        # 显示标准化识别结果表格
+        if dedup_records:
+            try:
+                df_recs = pd.DataFrame(dedup_records)
+                with st.expander(f"已识别需求预览 (共{len(df_recs)} 条)"):
+                    st.dataframe(df_recs[['来源', '需求编号', '摘要', '内容']].head(200), use_container_width=True)
+            except Exception:
+                # 退化显示
+                with st.expander("已识别需求 (纯文本预览)"):
+                    for i, r in enumerate(dedup_records[:200], 1):
+                        st.write(f"{i}. [{r['来源']}] {r['需求编号']} {r['摘要']}")
+
+        # 批量生成按钮
+        if st.button("批量生成 (混合来源)"):
+            if not unique_reqs:
+                st.error("没有可用需求")
+            else:
+                df_all = process_batch_requirements(
+                    base_url,
+                    unique_reqs,
+                    headers,
+                    model,
+                    pos_n,
+                    neg_n,
+                    edge_n,
+                    temperature,
+                    st.session_state.get('background_knowledge'),
+                    dynamic=auto_mode,
+                    dyn_params=dyn_params,
+                )
+                st.dataframe(df_all)
+                make_excel_download(df_all, "测试用例_批量.xlsx")
+                make_csv_download(df_all, "测试用例_批量.csv")
+    with tab3:
+        st.subheader("示例与最佳实践")
+        for ex in get_requirement_examples(): st.write(f"- {ex}")
+        st.markdown("---")
+        st.subheader("背景知识输入方式")
+        st.markdown("""
+        **支持的输入方式：**
+        - 📄 **上传文件**: 支持 .docx, .txt, .md, .pdf 格式
+        - 📝 **直接粘贴**: 复制文档内容直接粘贴到文本框
+        - 🌐 **网页链接**: 输入文档URL，自动抓取内容
+        - 🪶 **飞书文档**: 通过API访问或导出后上传
+
+        **飞书文档访问问题解决：**
+        - **权限不足**: 使用 tenant_access_token 只能访问公开文档
+        - **替代方案**:
+          1. 在飞书中导出为 Word/PDF → 上传文件
+          2. 复制文档内容 → 直接粘贴到文本框
+          3. 设置文档为公开分享 → 使用网页链接输入
+        """)
+        st.markdown("---")
+        st.subheader("标准输出格式模板")
+        output_tpl = get_output_format_template()
+        st.code(output_tpl, language="csv")
+        st.caption("这是生成的测试用例CSV的标准格式，第一行为表头，第二行为占位符示例。")
+    st.markdown("---")
+    st.subheader("标准 Prompt 模板")
+    tpl = get_standard_prompt_template()
+    st.code(tpl, language="text")
+    st.caption("占位符示例: {背景知识} / {列名逗号分隔} / {需求编号} / {需求全文} / {正向数} / {异常数} / {边界数} / {总用例数}")
+    st.caption("模型计费: MiMo-7B-RL 免费; 其余 (Qwen / Deepseek / Qwen2.5-VL) 计费 | 使用固定内部 API Key")
