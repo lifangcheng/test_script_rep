@@ -1,10 +1,13 @@
 """UI辅助函数模块"""
 
+import logging
+from collections import deque
+from typing import Any, Dict, List, Optional, Set
+
 import pandas as pd
 import streamlit as st
 from docx import Document
 from io import BytesIO, StringIO
-from typing import Dict, List, Optional, Any
 import re
 import PyPDF2
 import requests
@@ -30,7 +33,7 @@ def fetch_url_content(url: str, timeout: int = 10, max_chars: int = MAX_CHARS) -
     try:
         # Special handling for Feishu/Lark docs
         if 'feishu.cn' in url or 'larksuite' in url:
-            if re.search(r"/(?:docx|wiki|docs)/[A-Za-z0-9]+", url):
+            if re.search(r"/(?:docx|wiki|docs|sheets)/[A-Za-z0-9]+", url):
                 try:
                     content = fetch_feishu_document(url, debug=st.session_state.get("debug_mode", False))
                     if content and not content.startswith("【飞书API错误】"):
@@ -43,7 +46,7 @@ def fetch_url_content(url: str, timeout: int = 10, max_chars: int = MAX_CHARS) -
                     st.warning(f"飞书API访问失败: {str(e)}，尝试网页抓取方式")
 
         # Regular webpage handling 
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "TestCaseGenBot/1.0"})
+        r = requests.get(url, timeout=min(timeout, 15), headers={"User-Agent": "TestCaseGenBot/1.0"})
         if r.status_code != 200:
             return f"【失败 {r.status_code}】{url}"
         text = r.text
@@ -125,96 +128,127 @@ def fetch_feishu_document(url_or_id: str, debug: bool = False) -> str:
     Returns:
         Document content as markdown string
     """
+    # 优先尝试使用独立的 feishu_fetcher.py 脚本，因为它经过验证更稳定
     try:
-        # Hardcoded credentials for testing
-        app_id = "cli_a85ffa34d3fad00c"
-        app_secret = "MxD6ukGa9ZMJeGl5KicVSgNQLhnE1tcN"
+        import subprocess
+        import sys
 
-        if not app_id or not app_secret:
-            return "【飞书API错误】缺少FEISHU_APP_ID或FEISHU_APP_SECRET环境变量"
+        fetcher_path = os.path.join(os.path.dirname(__file__), "feishu_fetcher.py")
+        if os.path.exists(fetcher_path):
+            if debug:
+                print(f"[DEBUG] Invoking subprocess: {fetcher_path} {url_or_id}")
 
-        # Extract doc ID from URL
-        doc_input = url_or_id.strip()
-        m = re.search(r"/(?:docx|wiki|docs)/([A-Za-z0-9]+)", doc_input)
-        doc_id = m.group(1) if m else doc_input
+            # 确保环境变量传递给子进程，并强制使用 UTF-8
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
 
-        # Get access token
-        FEISHU_BASE_API = os.environ.get("FEISHU_OPEN_BASE", "https://open.feishu.cn")
-        token_endpoint = f"{FEISHU_BASE_API}/open-apis/auth/v3/tenant_access_token/internal"
-        payload = {"app_id": app_id, "app_secret": app_secret}
-        resp = requests.post(token_endpoint, json=payload, timeout=10)
-        if resp.status_code != 200:
-            return f"【飞书API错误】获取token失败: HTTP {resp.status_code}"
-        token_data = resp.json()
-        if token_data.get("code") != 0:
-            return f"【飞书API错误】获取token失败: {token_data.get('msg')}"
-        token = token_data["tenant_access_token"]
+            command = [sys.executable, fetcher_path, url_or_id]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                env=env
+            )
+            stdout, stderr = process.communicate(timeout=300)
 
-        # Check if wiki document
-        is_wiki = "/wiki/" in doc_input
-        if is_wiki and debug:
-            print(f"[DEBUG] Wiki document detected, using token as doc ID: {doc_id}")
+            if debug and stderr:
+                print(f"[DEBUG] Subprocess stderr: {stderr}")
 
-        # Get document content
-        doc_endpoint = f"{FEISHU_BASE_API}/open-apis/docx/v1/documents/{doc_id}"
-        blocks_endpoint = f"{FEISHU_BASE_API}/open-apis/docx/v1/documents/{doc_id}/blocks"
-        headers = {"Authorization": f"Bearer {token}"}
-
-        # Get root block
-        resp = requests.get(doc_endpoint, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return f"【飞书API错误】获取文档失败: HTTP {resp.status_code}"
-        doc_data = resp.json()
-        if doc_data.get("code") != 0:
-            return f"【飞书API错误】获取文档失败: {doc_data.get('msg')}"
-
-        # Get all blocks
-        all_text = []
-        page_token = ""
-        while True:
-            url = f"{blocks_endpoint}?page_size=50&page_token={page_token}"
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                return f"【飞书API错误】获取文档块失败: HTTP {resp.status_code}"
-            blocks_data = resp.json()
-            if blocks_data.get("code") != 0:
-                return f"【飞书API错误】获取文档块失败: {blocks_data.get('msg')}"
-
-            for block in blocks_data.get("data", {}).get("items", []):
-                text = ""
-                if "page" in block:
-                    # Page block - title and body
-                    text = block["page"].get("title", "")
-                    if text:
-                        all_text.append(f"# {text}")
-                    for para in block["page"].get("body", {}).get("blocks", []):
-                        if "text" in para:
-                            text = para["text"].get("content", "").strip()
-                            if text:
-                                all_text.append(text)
-                elif "text" in block:
-                    # Text block
-                    text = block["text"].get("content", "").strip()
-                    if text:
-                        all_text.append(text)
-
-            page_token = blocks_data.get("data", {}).get("page_token")
-            if not page_token:
-                break
-
-        content = "\n\n".join(all_text)
-        if not content.strip():
-            return "【飞书API错误】未获取到有效内容"
-        return content
+            if process.returncode == 0:
+                content = stdout.strip()
+                if content:
+                    return content
+                else:
+                    return "【飞书API错误】获取到的文档内容为空"
+            else:
+                error_msg = stderr.strip() if stderr else "未知错误"
+                return f"【飞书API错误】子进程执行失败 (Code {process.returncode}): {error_msg}"
 
     except Exception as e:
-        return f"【飞书API错误】{str(e)}"
+        return f"【飞书API错误】子进程调用异常: {str(e)}"
 
-def process_requirements_from_text(text: str, min_length: int = MIN_PARAGRAPH_LENGTH) -> List[str]:
+    # 如果代码执行到这里，说明 fetcher_path 不存在
+    return "【飞书API错误】找不到 feishu_fetcher.py 脚本"
+
+def process_requirements_from_text(text: str, min_length: int = 5) -> List[str]:
     """Extract requirements from text content."""
     if not text or not text.strip():
         return []
+
+    # 0. 优先策略：基于层级结构的逐行扫描
+    # 这种方法能准确识别模块（大标题）和需求（带ID的标题），并将模块信息关联到需求中
+    # 同时能有效剔除不属于当前需求的大标题（作为分割点）
+
+    lines = text.split('\n')
+    reqs = []
+    current_module = ""
+    current_req_lines = []
+
+    req_id_pattern = re.compile(r"(?:SR\d+|REQ-[\w-]+)", re.IGNORECASE)
+    # 匹配 Markdown 标题 (# ...)
+    header_pattern = re.compile(r"^#{1,6}\s+(.*)")
+
+    has_structured_content = False
+
+    for line in lines:
+        stripped = line.strip()
+        header_match = header_pattern.match(stripped)
+
+        if header_match:
+            has_structured_content = True
+            title_content = header_match.group(1)
+            has_id = req_id_pattern.search(title_content)
+
+            if has_id:
+                # 是需求标题 -> 新需求开始
+                # 1. 保存上一个需求
+                if current_req_lines:
+                    reqs.append("\n".join(current_req_lines))
+                    current_req_lines = []
+
+                # 2. 开始新需求
+                # 将当前模块名作为前缀加入，满足“放到对应的子目录下”的需求
+                if current_module:
+                    # 使用特殊格式标记模块，方便后续处理或阅读
+                    current_req_lines.append(f"【模块：{current_module}】 {stripped}")
+                else:
+                    current_req_lines.append(stripped)
+            else:
+                # 是目录标题 -> 模块切换，且是上一个需求的结束
+                # 1. 保存上一个需求
+                if current_req_lines:
+                    reqs.append("\n".join(current_req_lines))
+                    current_req_lines = []
+
+                # 2. 更新当前模块
+                current_module = title_content.strip()
+        else:
+            # 普通行，归属于当前需求（如果有的话）
+            if current_req_lines:
+                current_req_lines.append(line)
+
+    # 保存最后一个需求
+    if current_req_lines:
+        reqs.append("\n".join(current_req_lines))
+
+    # 如果成功提取到了需求，直接返回
+    if reqs and has_structured_content:
+        # 再次过滤过短的条目
+        valid_reqs = [r for r in reqs if len(r.strip()) > min_length]
+        if valid_reqs:
+            return valid_reqs
+
+    # 2. 回退到按双换行符分割 (标准段落)
     parts = re.split(r"\n\s*\n+", text.strip())
+    reqs = [p.strip() for p in parts if len(p.strip()) > min_length]
+    if len(reqs) > 0:
+        return reqs
+
+    # 3. 最后尝试按单换行符分割 (针对紧凑格式)
+    parts = text.strip().split("\n")
     return [p.strip() for p in parts if len(p.strip()) > min_length]
 
 def process_uploaded_files(files: List[BytesIO], min_length: int = MIN_PARAGRAPH_LENGTH) -> Dict[str, List[str]]:
@@ -306,32 +340,60 @@ def render_batch_input() -> None:
 def render_batch_preview() -> None:
     """Render preview of collected requirements."""
     st.markdown("### 需求预览")
-    
+
     # Collect all requirements
     all_reqs = []
-    
+
+    def _parse_req(source, content):
+        # 尝试提取需求编号 (SRxxxx, REQ-xxx)
+        req_id = ""
+        match = re.search(r"(SR\d+|REQ-[\w-]+)", content, re.IGNORECASE)
+        if match:
+            req_id = match.group(1)
+
+        # 尝试提取标题 (第一行，去除 #)
+        lines = content.strip().split('\n')
+        title = lines[0].strip().lstrip('#').strip()
+        if len(title) > 50:
+            title = title[:50] + "..."
+
+        return {
+            '来源': source,
+            '需求编号': req_id,
+            '需求标题': title,
+            '需求详情': content  # 保留完整内容
+        }
+
     # From Feishu
     if 'feishu_reqs' in st.session_state:
-        all_reqs.extend([{'来源': '飞书文档', '需求': r} 
+        all_reqs.extend([_parse_req('飞书文档', r)
                         for r in st.session_state['feishu_reqs']])
-    
+
     # From files
     for k in st.session_state:
         if k.startswith('file_reqs_'):
             source = k.replace('file_reqs_', '')
-            all_reqs.extend([{'来源': source, '需求': r} 
+            all_reqs.extend([_parse_req(source, r)
                            for r in st.session_state[k]])
-    
+
     # From manual input
     if 'manual_reqs' in st.session_state:
-        all_reqs.extend([{'来源': '手动输入', '需求': r} 
+        all_reqs.extend([_parse_req('手动输入', r)
                         for r in st.session_state['manual_reqs']])
-    
+
     if all_reqs:
         df = pd.DataFrame(all_reqs)
+        # 调整列顺序
+        cols = ['来源', '需求编号', '需求标题', '需求详情']
+        # 确保所有列都存在
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[cols]
+
         st.write(f"总计: {len(df)} 条需求")
         st.dataframe(df, use_container_width=True)
-        
+
         if st.button("清空所有需求"):
             # Clear all requirements
             for k in list(st.session_state.keys()):
@@ -339,7 +401,7 @@ def render_batch_preview() -> None:
                     del st.session_state[k]
             st.session_state['source_counts'] = []
             st.success("已清空所有需求")
-        
+
         # Show source summary
         if 'source_counts' in st.session_state and st.session_state['source_counts']:
             st.info("来源分布:\n" + "\n".join(st.session_state['source_counts']))

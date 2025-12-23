@@ -15,15 +15,15 @@ def test_feishu_credentials():
     """测试飞书API凭证"""
     print("=== 飞书API凭证测试 ===\n")
 
-    # 硬编码凭证
-    app_id = "cli_a85ffa34d3fad00c"
-    app_secret = "MxD6ukGa9ZMJeGl5KicVSgNQLhnE1tcN"
+    # 从环境变量获取凭证
+    app_id = os.environ.get("FEISHU_APP_ID")
+    app_secret = os.environ.get("FEISHU_APP_SECRET")
 
-    print(f"App ID: {app_id}")
+    print(f"App ID: {app_id if app_id else '未设置'}")
     print(f"App Secret: {'已设置' if app_secret else '未设置'}")
 
     if not app_id or not app_secret:
-        print("\n❌ 错误：飞书API凭证未配置")
+        print("\n[ERROR] 错误：飞书API凭证未配置")
         print("\n请按照以下步骤配置：")
         print("1. 访问 https://open.feishu.cn/app")
         print("2. 创建企业自建应用")
@@ -46,13 +46,13 @@ def test_feishu_credentials():
 
             if data.get("code") == 0:
                 token = data.get("tenant_access_token")
-                print(f"\n✅ Token获取成功: {token[:20]}...")
+                print(f"\n[OK] Token获取成功: {token[:20]}...")
                 return True
             else:
-                print(f"\n❌ API错误: {data.get('msg')}")
+                print(f"\n[ERROR] API错误: {data.get('msg')}")
                 return False
         else:
-            print(f"\n❌ HTTP错误: {response.status_code}")
+            print(f"\n[ERROR] HTTP错误: {response.status_code}")
             print(f"响应内容: {response.text}")
             return False
 

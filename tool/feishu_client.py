@@ -262,7 +262,7 @@ class FeishuClient:
         if self.debug:
             logger.debug(f"GET {url}")
             
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=(10, 30))
         
         if self.debug:
             logger.debug(f"Response status: {resp.status_code}")

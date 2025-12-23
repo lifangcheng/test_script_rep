@@ -102,7 +102,7 @@ def api_get(url: str, token: str, debug: bool = False) -> Dict:
     if debug:
         print(f"[DBG] GET {url}")
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=(10, 30))
     except requests.RequestException as e:
         raise RuntimeError(f"GET {url} network error: {e}")
     if debug:

@@ -9,6 +9,8 @@ import pandas as pd
 import streamlit as st
 from docx import Document
 from openai import OpenAI
+from ai_requirement_processor import AIRequirementProcessor, estimate_requirement_complexity
+import json
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +43,73 @@ def handle_errors(func):
 # =========================
 # Helpers: read requirements
 # =========================
+
+def identify_requirements_with_ai(full_text: str, filename: str) -> List[str]:
+    """使用AI智能识别文档中的需求"""
+    try:
+        # 检查是否有API配置
+        api_key = st.session_state.get('api_key') or os.getenv("DEEPSEEK_API_KEY", "")
+        base_url = st.session_state.get('base_url', "https://api.deepseek.com")
+        
+        if not api_key:
+            st.warning("未配置API Key，无法使用AI需求识别")
+            return []
+        
+        # 创建AI客户端
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        
+        # 构建提示词
+        prompt = f"""请从以下文档内容中识别出所有的软件需求。文档内容：
+        
+{full_text[:4000]}  # 限制文本长度避免token超限
+
+请按照以下要求识别需求：
+1. 识别独立的功能需求、性能需求、安全需求等
+2. 每个需求应该是完整、可测试的独立单元
+3. 忽略文档的格式标记、标题、页眉页脚等非需求内容
+4. 将识别出的需求按JSON数组格式返回
+
+返回格式：
+{{
+    "requirements": [
+        "需求1描述",
+        "需求2描述",
+        ...
+    ]
+}}
+
+请只返回JSON格式，不要有其他内容。"""
+        
+        response = client.chat.completions.create(
+            model=st.session_state.get('model', 'deepseek-chat'),
+            messages=[
+                {"role": "system", "content": "你是一个专业的软件需求分析师，能够准确识别文档中的软件需求。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        
+        result_text = response.choices[0].message.content
+        
+        # 解析结果
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+            requirements = result.get("requirements", [])
+            
+            # 过滤空需求和过短需求
+            filtered_reqs = [req.strip() for req in requirements 
+                           if req.strip() and len(req.strip()) > MIN_PARAGRAPH_LENGTH]
+            
+            return filtered_reqs
+        else:
+            st.warning("AI需求识别返回格式不正确")
+            return []
+            
+    except Exception as e:
+        logger.error(f"AI需求识别失败 ({filename}): {e}")
+        st.warning(f"AI需求识别失败: {str(e)}")
+        return []
 def read_word(file) -> str:
     """读取Word文档内容"""
     try:
@@ -248,6 +317,17 @@ with tab_single:
 # ============ 批量需求 ============
 with tab_batch:
     st.subheader("批量需求导入")
+    
+    # AI需求处理配置
+    st.markdown("#### AI需求智能处理")
+    col1, col2 = st.columns(2)
+    with col1:
+        enable_ai_analysis = st.checkbox("启用AI需求分析", value=True, 
+                                       help="使用AI自动识别需求类型、优先级和复杂度")
+    with col2:
+        enable_ai_decomposition = st.checkbox("启用AI需求分解", value=True,
+                                            help="自动将复杂需求分解为可测试的子需求")
+    
     uploaded = st.file_uploader("上传 Excel（.xlsx）或 Word（.docx）", type=["xlsx", "docx"])
 
     if uploaded:
@@ -262,6 +342,42 @@ with tab_batch:
             batch_rows = df_sheet[col].dropna().astype(str).str.strip()
             st.caption(f"已收集有效需求 {batch_rows.shape[0]} 条")
 
+            # AI需求分析按钮
+            if enable_ai_analysis and api_key and not batch_rows.empty:
+                if st.button("🔍 执行AI需求分析", type="secondary"):
+                    with st.spinner("正在执行AI需求分析..."):
+                        try:
+                            # 创建AI处理器
+                            ai_processor = AIRequirementProcessor(
+                                client=make_client(api_key, base_url),
+                                model=model,
+                                temperature=temperature
+                            )
+                            
+                            # 执行AI分析
+                            req_texts = batch_rows.tolist()
+                            processed_reqs = ai_processor.process_batch_requirements(req_texts)
+                            
+                            # 显示分析结果
+                            analysis_df = pd.DataFrame([{
+                                "原始需求": req["original_requirement"],
+                                "处理需求": req["sub_requirement"],
+                                "类型": req["type"],
+                                "优先级": req["priority"],
+                                "复杂度": req["complexity"],
+                                "是否分解": "是" if req["is_decomposed"] else "否"
+                            } for req in processed_reqs])
+                            
+                            st.success(f"AI分析完成！共分析 {len(processed_reqs)} 条需求")
+                            st.dataframe(analysis_df, use_container_width=True)
+                            
+                            # 更新需求列表为处理后的需求
+                            processed_req_texts = [req["sub_requirement"] for req in processed_reqs]
+                            batch_rows = pd.Series(processed_req_texts)
+                            
+                        except Exception as e:
+                            st.error(f"AI需求分析失败: {str(e)}")
+            
             if st.button("🚀 生成测试用例（批量）", type="primary", use_container_width=True):
                 if not api_key:
                     st.error("请在侧边栏配置 DeepSeek API Key")
@@ -271,7 +387,34 @@ with tab_batch:
                     client = make_client(api_key, base_url)
                     all_cases = []
                     with st.spinner("批量生成中，请稍候……"):
-                        for idx, req in enumerate(batch_rows, start=1):
+                        
+                        # 如果启用了AI分解，对复杂需求进行分解
+                        req_list = batch_rows.tolist()
+                        if enable_ai_decomposition:
+                            try:
+                                ai_processor = AIRequirementProcessor(
+                                    client=client,
+                                    model=model,
+                                    temperature=temperature
+                                )
+                                
+                                decomposed_reqs = []
+                                for req_text in req_list:
+                                    complexity = estimate_requirement_complexity(req_text)
+                                    if complexity == "高":
+                                        sub_reqs = ai_processor.decompose_requirement(req_text)
+                                        for sub_req in sub_reqs:
+                                            decomposed_reqs.append(sub_req["sub_requirement"])
+                                    else:
+                                        decomposed_reqs.append(req_text)
+                                
+                                req_list = decomposed_reqs
+                                st.info(f"AI分解后共 {len(req_list)} 条可测试需求")
+                                
+                            except Exception as e:
+                                st.warning(f"AI需求分解失败，使用原始需求: {str(e)}")
+                        
+                        for idx, req in enumerate(req_list, start=1):
                             prompt = build_prompt(req, headers, pos_n, neg_n, edge_n)
                             try:
                                 csv_text = call_deepseek(client, model, prompt, temperature)
@@ -291,12 +434,63 @@ with tab_batch:
 
         elif uploaded.name.lower().endswith(".docx"):
             content = read_word(uploaded)
-            split_mode = st.radio("Word 分段方式", ["按空行分段", "整篇作为一条需求"], horizontal=True)
-            reqs = split_word_requirements(content, mode="by_blank_line" if split_mode == "按空行分段" else "single")
+            
+            if enable_ai_analysis:
+                st.info("使用AI智能识别Word文档中的需求...")
+                # 使用AI智能识别需求
+                ai_reqs = identify_requirements_with_ai(content, uploaded.name)
+                if ai_reqs:
+                    reqs = ai_reqs
+                    st.success(f"AI智能识别出 {len(reqs)} 条需求")
+                else:
+                    # AI识别失败，使用传统方法
+                    split_mode = st.radio("Word 分段方式", ["按空行分段", "整篇作为一条需求"], horizontal=True)
+                    reqs = split_word_requirements(content, mode="by_blank_line" if split_mode == "按空行分段" else "single")
+                    st.info(f"传统方法识别出 {len(reqs)} 条需求")
+            else:
+                # 不使用AI，使用传统方法
+                split_mode = st.radio("Word 分段方式", ["按空行分段", "整篇作为一条需求"], horizontal=True)
+                reqs = split_word_requirements(content, mode="by_blank_line" if split_mode == "按空行分段" else "single")
+                st.info(f"识别出 {len(reqs)} 条需求")
+            
             st.caption(f"已识别需求段落 {len(reqs)} 条")
             if len(reqs) > 0:
                 st.text_area("段落预览", value="\n\n".join(reqs[:5]), height=200)
 
+            # AI需求分析按钮
+            if enable_ai_analysis and api_key and reqs:
+                if st.button("🔍 执行AI需求分析", type="secondary"):
+                    with st.spinner("正在执行AI需求分析..."):
+                        try:
+                            # 创建AI处理器
+                            ai_processor = AIRequirementProcessor(
+                                client=make_client(api_key, base_url),
+                                model=model,
+                                temperature=temperature
+                            )
+                            
+                            # 执行AI分析
+                            processed_reqs = ai_processor.process_batch_requirements(reqs)
+                            
+                            # 显示分析结果
+                            analysis_df = pd.DataFrame([{
+                                "原始需求": req["original_requirement"],
+                                "处理需求": req["sub_requirement"],
+                                "类型": req["type"],
+                                "优先级": req["priority"],
+                                "复杂度": req["complexity"],
+                                "是否分解": "是" if req["is_decomposed"] else "否"
+                            } for req in processed_reqs])
+                            
+                            st.success(f"AI分析完成！共分析 {len(processed_reqs)} 条需求")
+                            st.dataframe(analysis_df, use_container_width=True)
+                            
+                            # 更新需求列表为处理后的需求
+                            reqs = [req["sub_requirement"] for req in processed_reqs]
+                            
+                        except Exception as e:
+                            st.error(f"AI需求分析失败: {str(e)}")
+            
             if st.button("🚀 生成测试用例（批量）", type="primary", use_container_width=True):
                 if not api_key:
                     st.error("请在侧边栏配置 DeepSeek API Key")
@@ -306,7 +500,34 @@ with tab_batch:
                     client = make_client(api_key, base_url)
                     all_cases = []
                     with st.spinner("批量生成中，请稍候……"):
-                        for idx, req in enumerate(reqs, start=1):
+                        
+                        # 如果启用了AI分解，对复杂需求进行分解
+                        req_list = reqs
+                        if enable_ai_decomposition:
+                            try:
+                                ai_processor = AIRequirementProcessor(
+                                    client=client,
+                                    model=model,
+                                    temperature=temperature
+                                )
+                                
+                                decomposed_reqs = []
+                                for req_text in req_list:
+                                    complexity = estimate_requirement_complexity(req_text)
+                                    if complexity == "高":
+                                        sub_reqs = ai_processor.decompose_requirement(req_text)
+                                        for sub_req in sub_reqs:
+                                            decomposed_reqs.append(sub_req["sub_requirement"])
+                                    else:
+                                        decomposed_reqs.append(req_text)
+                                
+                                req_list = decomposed_reqs
+                                st.info(f"AI分解后共 {len(req_list)} 条可测试需求")
+                                
+                            except Exception as e:
+                                st.warning(f"AI需求分解失败，使用原始需求: {str(e)}")
+                        
+                        for idx, req in enumerate(req_list, start=1):
                             prompt = build_prompt(req, headers, pos_n, neg_n, edge_n)
                             try:
                                 csv_text = call_deepseek(client, model, prompt, temperature)

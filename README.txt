@@ -1,4 +1,4 @@
-deepseek key
+IAM key
 sk-e70a9af7db3942d28169cc6c55e2a4d6
 
 AIzaSyCp1CT_JoEihY21Ij-31Q8NypW0YXgVuK4

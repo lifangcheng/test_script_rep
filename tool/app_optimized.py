@@ -34,8 +34,8 @@ class AppConfig:
 
     # 模型配置
     MODEL_MAP = {
+        "Qwen-235B-A22B": "Qwen-235B-A22B",
         "MiMo-7B-RL": "MiMo-7B-RL",
-        "Qwen-235B-A22B": "Qwen-235B-A22B", 
         "deepseek-v3.1": "deepseek-v3.1",
         "Qwen2.5-VL-72B-Instruct-AWQ": "Qwen2.5-VL-72B-Instruct-AWQ",
         "mock-model": "mock-model",
@@ -541,7 +541,7 @@ def process_batch_requirements(api_key: str, base_url: str, requirements: List[s
         # Add a delay to avoid hitting rate limits, especially for batch jobs.
         # This helps respect policies like "requests per minute".
         if i < total - 1: # No need to wait after the last item
-            time.sleep(2) # Wait for 2 seconds before the next request
+            time.sleep(0.1) # Wait for 0.1 seconds before the next request
 
     pb.empty(); status.empty()
     if all_cases:
@@ -553,20 +553,14 @@ def setup_sidebar() -> tuple:
     with st.sidebar:
         st.header("连接设置")
         api_key = st.text_input("API Key（可选）", type="password", key="api_key_input")
-        model = st.selectbox("模型", ["deepseek-chat", "chatgpt", "gemini", "local-model", "mock-model"], key="model_select")
+        model = st.selectbox("模型", AppConfig.ALLOWED_MODELS, key="model_select")
 
         # auto-select sensible base_url based on model
-        if model == "chatgpt":
-            suggested_base = "https://api.openai.com"
-            st.info("已为 chatgpt 建议将 API Base URL 设置为 https://api.openai.com（可修改）")
-        elif model == "deepseek-chat":
-            suggested_base = AppConfig.DEFAULT_BASE_URL
-            st.info(f"已为 deepseek 建议将 API Base URL 设置为 {AppConfig.DEFAULT_BASE_URL}（可修改）")
-        elif model == "gemini":
+        if model == "gemini":
             suggested_base = "https://generativelanguage.googleapis.com"
             st.info(f"已为 gemini 建议将 API Base URL 设置为 {suggested_base}（可修改）")
         else:
-            suggested_base = DEFAULT_BASE_URL
+            suggested_base = AppConfig.DEFAULT_BASE_URL
 
         base_url = st.text_input("API Base URL", value=suggested_base, key="base_url_input")
         local_model_url = st.text_input("本地模型 URL (http)", placeholder="http://127.0.0.1:8000/v1/generate", key="local_model_url")
@@ -699,7 +693,7 @@ def setup_sidebar() -> tuple:
 
         st.divider()
         st.header("用例配置")
-        headers_text = st.text_input("列名（逗号分隔）", value=",".join(DEFAULT_HEADERS), key="headers_input")
+        headers_text = st.text_input("列名（逗号分隔）", value=",".join(AppConfig.DEFAULT_HEADERS), key="headers_input")
         headers = [h.strip() for h in headers_text.split(",") if h.strip()]
         pos_n = st.number_input("正向", min_value=1, max_value=20, value=2, key="pos_n_input")
         neg_n = st.number_input("异常", min_value=1, max_value=20, value=2, key="neg_n_input")
