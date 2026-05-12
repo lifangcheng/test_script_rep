@@ -1,0 +1,108 @@
+{
+  "status": "success",
+  "error": null,
+  "logs": [
+    {
+      "stage": "validate_input",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "validate_input",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "load_skills",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "load_skills",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "parse_blf",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "parse_blf",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "decode_dbc",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "decode_dbc",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "build_dataframe",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "build_dataframe",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "anomaly_detect",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "anomaly_detect",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "summarize",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "summarize",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "report_generate",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "report_generate",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "signal_index",
+      "status": "running",
+      "error": null
+    },
+    {
+      "stage": "signal_index",
+      "status": "success",
+      "error": null
+    },
+    {
+      "stage": "ai_analyze",
+      "status": "success",
+      "error": null
+    }
+  ],
+  "blf": "D:\\project\\TestCase_auto_gen\\tool\\AI_analysis\\can-agent\\MT516 26A V2L 微波炉-20260126170402_CAN.blf",
+  "dbc": "D:\\project\\TestCase_auto_gen\\tool\\AI_analysis\\can-agent\\MS12&MS13_EDCU_PTCANFD_251301.dbc",
+  "out_dir": "D:\\project\\TestCase_auto_gen\\tool\\AI_analysis\\can-agent\\microwave_analysis\\MT516 26A V2L 微波炉-20260126170402_CAN",
+  "report_html": "D:\\project\\TestCase_auto_gen\\tool\\AI_analysis\\can-agent\\microwave_analysis\\MT516 26A V2L 微波炉-20260126170402_CAN\\report.html",
+  "report_json": "D:\\project\\TestCase_auto_gen\\tool\\AI_analysis\\can-agent\\microwave_analysis\\MT516 26A V2L 微波炉-20260126170402_CAN\\report.json",
+  "signals_count": 3,
+  "anomalies_count": 4
+}

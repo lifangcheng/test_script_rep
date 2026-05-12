@@ -1,0 +1,136 @@
+{
+  "generated_at": "1970-01-01T00:00:00Z",
+  "base_time": {
+    "unix": null,
+    "iso": null
+  },
+  "time_range": {
+    "start": 1769418243.20258,
+    "end": 1769418287.7046518
+  },
+  "time_range_iso": {
+    "start_iso": "2026-01-26T09:04:03.202580Z",
+    "end_iso": "2026-01-26T09:04:47.704652Z"
+  },
+  "stats": {
+    "rows": 4897,
+    "signals": 3,
+    "frames": 3,
+    "anomalies": 4
+  },
+  "diagnosis": {
+    "summary": {
+      "total_anomalies": 4,
+      "by_kind": {
+        "rule_trigger": 4
+      },
+      "by_severity": {
+        "high": 4
+      },
+      "top_signals": [
+        {
+          "signal": "OBCFltLvlIndcn",
+          "count": 4
+        }
+      ]
+    },
+    "notes": [
+      "This diagnosis is rule-based. Validate against vehicle context and DBC definitions."
+    ]
+  },
+  "anomalies": [
+    {
+      "kind": "rule_trigger",
+      "severity": "high",
+      "signal": "OBCFltLvlIndcn",
+      "start": 1769418274.9842348,
+      "end": 1769418281.244387,
+      "count": 314,
+      "evidence": {
+        "rule": {
+          "id": "obc_fault_level_nonzero",
+          "name": "OBC故障等级非0",
+          "condition": "!= 0"
+        }
+      },
+      "rule_source": "skills\\default\\rules.yaml",
+      "rule_id": "obc_fault_level_nonzero",
+      "rule_name": "OBC故障等级非0",
+      "rule_condition": "!= 0",
+      "slice_id": "OBCFltLvlIndcn_320_1769418274",
+      "start_iso": "2026-01-26T09:04:34.984235Z",
+      "end_iso": "2026-01-26T09:04:41.244387Z",
+      "can_id_hex": "0x140"
+    },
+    {
+      "kind": "rule_trigger",
+      "severity": "high",
+      "signal": "OBCFltLvlIndcn",
+      "start": 1769418274.9842348,
+      "end": 1769418281.244387,
+      "count": 314,
+      "evidence": {
+        "rule": {
+          "id": "obc_fault_level_nonzero_eval2",
+          "name": "OBC故障等级非0(Eval2新增)",
+          "condition": "!= 0"
+        }
+      },
+      "rule_source": "skills\\default\\rules.yaml",
+      "rule_id": "obc_fault_level_nonzero_eval2",
+      "rule_name": "OBC故障等级非0(Eval2新增)",
+      "rule_condition": "!= 0",
+      "slice_id": "OBCFltLvlIndcn_320_1769418274",
+      "start_iso": "2026-01-26T09:04:34.984235Z",
+      "end_iso": "2026-01-26T09:04:41.244387Z",
+      "can_id_hex": "0x140"
+    },
+    {
+      "kind": "rule_trigger",
+      "severity": "high",
+      "signal": "OBCFltLvlIndcn",
+      "start": 1769418274.9842348,
+      "end": 1769418281.244387,
+      "count": 314,
+      "evidence": {
+        "rule": {
+          "id": "obc_fault_level_nonzero_strict",
+          "name": "OBC故障等级非0(严格)",
+          "condition": "!= 0"
+        }
+      },
+      "rule_source": "skills\\default\\rules.yaml",
+      "rule_id": "obc_fault_level_nonzero_strict",
+      "rule_name": "OBC故障等级非0(严格)",
+      "rule_condition": "!= 0",
+      "slice_id": "OBCFltLvlIndcn_320_1769418274",
+      "start_iso": "2026-01-26T09:04:34.984235Z",
+      "end_iso": "2026-01-26T09:04:41.244387Z",
+      "can_id_hex": "0x140"
+    },
+    {
+      "kind": "rule_trigger",
+      "severity": "high",
+      "signal": "OBCFltLvlIndcn",
+      "start": 1769418274.9842348,
+      "end": 1769418281.244387,
+      "count": 314,
+      "evidence": {
+        "rule": {
+          "id": "obc_fault_level_nonzero_value",
+          "name": "OBC故障等级非0(值字段)",
+          "condition": "!= 0"
+        }
+      },
+      "rule_source": "skills\\default\\rules.yaml",
+      "rule_id": "obc_fault_level_nonzero_value",
+      "rule_name": "OBC故障等级非0(值字段)",
+      "rule_condition": "!= 0",
+      "slice_id": "OBCFltLvlIndcn_320_1769418274",
+      "start_iso": "2026-01-26T09:04:34.984235Z",
+      "end_iso": "2026-01-26T09:04:41.244387Z",
+      "can_id_hex": "0x140"
+    }
+  ],
+  "ai_report": null
+}

@@ -1,0 +1,20 @@
+{
+  "summary": {
+    "total_anomalies": 4,
+    "by_kind": {
+      "rule_trigger": 4
+    },
+    "by_severity": {
+      "high": 4
+    },
+    "top_signals": [
+      {
+        "signal": "OBCFltLvlIndcn",
+        "count": 4
+      }
+    ]
+  },
+  "notes": [
+    "This diagnosis is rule-based. Validate against vehicle context and DBC definitions."
+  ]
+}

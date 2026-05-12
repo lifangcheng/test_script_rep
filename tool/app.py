@@ -56,7 +56,22 @@ def identify_requirements_with_ai(full_text: str, filename: str) -> List[str]:
             return []
         
         # 创建AI客户端
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        import uuid
+        base = str(base_url or "").rstrip("/")
+        if "model.mify.ai.srv" in base and not base.endswith("/v1"):
+            base = base + "/v1"
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base,
+            default_headers=(
+                {
+                    "X-Model-Provider-Id": "xiaomi",
+                    "X-Model-Request-Id": str(uuid.uuid4()),
+                }
+                if "model.mify.ai.srv" in base
+                else None
+            ),
+        )
         
         # 构建提示词
         prompt = f"""请从以下文档内容中识别出所有的软件需求。文档内容：
@@ -156,7 +171,25 @@ def make_client(api_key: str, base_url: str) -> OpenAI:
     """创建OpenAI客户端，带缓存"""
     if not api_key:
         raise ValueError("API Key 不能为空")
-    return OpenAI(api_key=api_key, base_url=base_url)
+
+    import uuid
+
+    base = str(base_url or "").rstrip("/")
+    if "model.mify.ai.srv" in base and not base.endswith("/v1"):
+        base = base + "/v1"
+
+    return OpenAI(
+        api_key=api_key,
+        base_url=base,
+        default_headers=(
+            {
+                "X-Model-Provider-Id": "xiaomi",
+                "X-Model-Request-Id": str(uuid.uuid4()),
+            }
+            if "model.mify.ai.srv" in base
+            else None
+        ),
+    )
 
 
 # =========================

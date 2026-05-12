@@ -1,0 +1,23 @@
+{
+  "skill_name": "can-agent",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Use the DBC in the current folder (MS12&MS13_EDCU_PTCANFD_251301.dbc) to analyze the BLF in the current folder (MT516 26A V2L 微波炉-20260126170402_CAN.blf). Generate outputs into outputs/eval_single and tell me where report.html is.",
+      "expected_output": "CLI runs successfully and produces outputs/eval_single/report.html and report.json with anomalies and UTC iso times.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "Batch analyze all *.blf under C:/Users/lifangcheng/Downloads/log/log using MS12&MS13_EDCU_PTCANFD_251301.dbc. Put each run under outputs/batch/<blf_basename>/ and summarize success vs failure counts and top anomaly kinds.",
+      "expected_output": "A loop runs can-agent for each BLF, produces per-file reports, and prints a concise aggregate summary.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Update skills/default/rules.yaml by adding a rule that flags signal 'OBCFltLvlIndcn' when value != 0 (severity high), then rerun analysis on MT516 26A V2L 微波炉-20260126170402_CAN.blf and confirm rule_trigger anomalies are linked to the new rule in report.json.",
+      "expected_output": "rules.yaml updated correctly; rerun generates rule_trigger anomalies with rule_id/rule_name/rule_condition filled and visible in report.json/report.html.",
+      "files": []
+    }
+  ]
+}

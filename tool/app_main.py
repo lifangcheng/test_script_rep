@@ -1,4 +1,6 @@
-"""AI 测试用例生成器 (整洁重构版)
+r"""AI 测试用例生成器 (整洁重构版)
+
+streamlit run tool/app_main.py
 
 保留功能:
  - 单条/批量需求用例生成
@@ -15,7 +17,17 @@
  - 移除未使用的 mock 生成函数与无用 import
  - 增加模型标签 (免费 / 计费)
  - 代码块结构化: 常量区 / 工具函数 / 模型调用 / 解析 / UI
+
+   Summary of Dependencies:
+   * d:\\project\\TestCase_auto_gen\\tool\\ai_requirement_processor.py
+   * d:\project\TestCase_auto_gen\tool\helper_functions.py
+   * d:\project\TestCase_auto_gen\tool\coverage_analyzer.py
+   * d:\project\TestCase_auto_gen\tool\feishu_fetcher.py
+   * d:\project\TestCase_auto_gen\tool\app_optimized.py
+   * d:\project\TestCase_auto_gen\.env
 """
+
+
 
 import re
 import logging
@@ -38,7 +50,8 @@ except Exception:
     openai = None  # noqa
 import os
 import sys
-import subprocess
+# NOTE: Avoid spawning subprocesses from within the Streamlit app.
+# In packaged mode this can result in additional app instances/ports.
 import argparse
 
 # --- Hardcoded Feishu Credentials ---
@@ -54,6 +67,8 @@ os.environ.setdefault("FEISHU_APP_SECRET", FEISHU_APP_SECRET)
 
 from ai_requirement_processor import AIRequirementProcessor, estimate_requirement_complexity
 from helper_functions import fetch_feishu_document, process_requirements_from_text
+from coverage_analyzer import parse_markdown_table_to_df, map_cases_to_requirements
+from script_consistency_checker import check_script_consistency
 
 # 加载环境变量配置
 try:
@@ -73,7 +88,7 @@ except Exception as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DEFAULT_HEADERS = ["测试名称", "需求编号", "需求描述", "测试描述", "前置条件", "测试步骤", "预期结果", "需求追溯"]
+DEFAULT_HEADERS = ["测试名称", "需求编号", "需求描述", "测试描述", "前置条件", "测试步骤", "预期结果"]
 DEFAULT_BASE_URL = "http://model.mify.ai.srv"  # 内部服务优先
 MAX_RETRY_ATTEMPTS = 3
 MIN_PARAGRAPH_LENGTH = 10
@@ -143,29 +158,29 @@ def get_feishu_user_access_token(app_id: str, app_secret: str, code: str, debug:
     }
     if debug:
         print(f"[DBG] Requesting user token with code: {code[:10]}...")
-    
+
     try:
         resp = requests.post(FEISHU_OAUTH_TOKEN_URL, json=payload, timeout=10)
     except requests.RequestException as e:
         raise RuntimeError(f"User token request network error: {e}")
-    
+
     if debug:
         print(f"[DBG] User token HTTP status: {resp.status_code}")
-    
+
     if resp.status_code != 200:
         raise RuntimeError(f"User token HTTP {resp.status_code}: {resp.text[:300]}")
-    
+
     try:
         data = resp.json()
     except ValueError:
         raise RuntimeError(f"User token response not JSON: {resp.text[:200]}")
-    
+
     if debug:
         print(f"[DBG] User token raw JSON: {json.dumps(data, ensure_ascii=False)[:400]}")
-    
+
     if data.get("code") != 0:
         raise RuntimeError(f"User token error code={data.get('code')} msg={data.get('msg')}")
-    
+
     return data["data"]["access_token"]
 def get_feishu_tenant_access_token(debug: bool = False, retries: int = 3, base_delay: float = 0.8) -> str:
     payload = {"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}
@@ -212,11 +227,11 @@ def get_feishu_tenant_access_token(debug: bool = False, retries: int = 3, base_d
 def feishu_api_get(url: str, token: str, debug: bool = False) -> Dict:
     """优化版飞书API GET请求 - 减少超时和调试输出"""
     headers = {"Authorization": f"Bearer {token}"}
-    
+
     # 简化调试输出
     if debug:
         print(f"[DBG] GET {url[:100]}...")
-    
+
     try:
         # 更宽松的超时设置以避免网络问题
         resp = requests.get(url, headers=headers, timeout=(30, 60))
@@ -224,25 +239,25 @@ def feishu_api_get(url: str, token: str, debug: bool = False) -> Dict:
         if debug:
             print(f"[DBG] 网络错误: {e}")
         raise RuntimeError(f"GET {url} network error: {e}")
-    
+
     if resp.status_code != 200:
         if debug:
             print(f"[DBG] HTTP {resp.status_code}")
         # 简化错误信息
         raise RuntimeError(f"API HTTP {resp.status_code}")
-    
+
     try:
         data = resp.json()
     except ValueError:
         if debug:
             print(f"[DBG] JSON解析失败")
         raise RuntimeError(f"Response not JSON")
-    
+
     if data.get("code") not in (0, None):
         if debug:
             print(f"[DBG] API错误: {data.get('code')}")
         raise RuntimeError(f"API error code={data.get('code')}")
-    
+
     return data
 
 def _fetch_blocks_recursive_helper(doc_id: str, block_id: str, token: str, all_blocks: List[Dict], visited: set, debug: bool, depth: int = 0):
@@ -262,7 +277,7 @@ def _fetch_blocks_recursive_helper(doc_id: str, block_id: str, token: str, all_b
         url = FEISHU_BLOCKS_ENDPOINT_TMPL.format(doc_id=doc_id, block_id=block_id, page_size=500, page_token=page_token)
         try:
             data = feishu_api_get(url, token, debug=(debug and depth <= 1))
-            
+
             items = data.get("data", {}).get("items", [])
             if not items:
                 # Fallback for older API or single block fetch
@@ -280,7 +295,7 @@ def _fetch_blocks_recursive_helper(doc_id: str, block_id: str, token: str, all_b
                     if 'children' in block and block['children']:
                         for child_id in block['children']:
                             _fetch_blocks_recursive_helper(doc_id, child_id, token, all_blocks, visited, debug, depth + 1)
-            
+
             page_token = data.get("data", {}).get("page_token", "")
             has_more = data.get("data", {}).get("has_more", False)
             if not page_token or not has_more:
@@ -310,7 +325,7 @@ def feishu_blocks_to_markdown(blocks: List[Dict]) -> str:
     for block in blocks:
         block_type = block.get("block_type")
         text = ""
-        
+
         # Extract raw text based on block type
         if block_type == 1: # Page
             text = extract_raw_text_from_elements(block.get("page", {}).get("elements"))
@@ -339,7 +354,7 @@ def feishu_blocks_to_markdown(blocks: List[Dict]) -> str:
             table_data = block.get("table", {})
             cells = table_data.get("cells", [])
             md_table = []
-            
+
             for i, row_cell_ids in enumerate(cells):
                 md_row = []
                 for cell_container_id in row_cell_ids:
@@ -352,7 +367,7 @@ def feishu_blocks_to_markdown(blocks: List[Dict]) -> str:
                                 # This is a simplified text extraction for cells
                                 child_text = feishu_blocks_to_markdown([child_block])
                                 cell_text_parts.append(child_text)
-                    
+
                     # Join parts and escape pipe characters for markdown table
                     cell_text = " ".join(cell_text_parts).replace("\n", " ").replace("|", "\\|")
                     md_row.append(cell_text)
@@ -362,13 +377,13 @@ def feishu_blocks_to_markdown(blocks: List[Dict]) -> str:
             if md_table and table_data.get("property", {}).get("header_row"):
                 header_separator = "| " + " | ".join(["---"] * len(cells[0])) + " |"
                 md_table.insert(1, header_separator)
-            
+
             lines.append("\n".join(md_table))
 
         elif block_type == 27: # Image
             token = block.get("image", {}).get("token")
             lines.append(f"![Image]({token})")
-            
+
         elif block_type == 31: # Bitable
             token = block.get("bitable", {}).get("token")
             lines.append(f"\n[Embedded Bitable: {token}]\n")
@@ -387,49 +402,20 @@ def feishu_blocks_to_markdown(blocks: List[Dict]) -> str:
     return "\n".join(final_text)
 
 def fetch_feishu_document_via_subprocess(url: str, debug: bool = False) -> str:
-    """Invokes the standalone feishu_fetcher.py script to fetch content."""
-    fetcher_path = os.path.join(os.path.dirname(__file__), "feishu_fetcher.py")
-    command = [sys.executable, fetcher_path, url]
-    
-    if debug:
-        print(f"[DBG] Invoking subprocess: {' '.join(command)}")
+    """Deprecated wrapper: keep name but fetch in-process.
+
+    Spawning subprocesses from a Streamlit app (especially packaged as onefile)
+    can lead to an additional Streamlit instance with a different port.
+    """
 
     try:
-        # Start the subprocess
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='ignore'
-        )
-        
-        # Wait for the process to complete and get the output
-        stdout, stderr = process.communicate(timeout=180) # 180-second timeout
-        
-        if debug and stderr:
-            print(f"[FETCHER_STDERR]\n{stderr}")
+        from helper_functions import fetch_feishu_document as _fetch
 
-        if process.returncode == 0:
-            return stdout.strip()
-        else:
-            # If the fetcher script fails, return its specific error message
-            error_message = stderr.strip()
-            if not error_message:
-                error_message = f"Fetcher script exited with code {process.returncode}."
-            return f"【飞书API错误】{error_message}"
-
-    except subprocess.TimeoutExpired:
-        if debug:
-            print("[DBG] Subprocess timed out.")
-        return "【飞书API错误】获取文档超时。"
-    except FileNotFoundError:
-        return f"【飞书API错误】无法找到 fetcher 脚本: {fetcher_path}"
+        return _fetch(url, debug=debug)
     except Exception as e:
         if debug:
-            print(f"[DBG] Subprocess execution failed: {e}")
-        return f"【飞书API错误】调用 fetcher 脚本时发生未知异常: {e}"
+            print(f"[DBG] In-process fetch failed: {e}")
+        return f"【飞书API错误】{e}"
 
 def _is_valid_url(u: str) -> bool:
     try:
@@ -497,58 +483,58 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                 else:
                     # 没有API凭证，直接使用网页抓取
                     update_progress("web_scrape", "无API凭证，使用网页抓取")
-                    
+
                     # 继续执行到网页抓取
             else:
                 # 不是文档链接，使用网页抓取
                 update_progress("web_scrape", "非文档链接，使用网页抓取")
-                
+
                 # 继续执行到网页抓取
         else:
             # 不是飞书链接，使用网页抓取
             update_progress("web_scrape", "非飞书链接，使用网页抓取")
-            
+
             # 继续执行到网页抓取
-        
+
         # 优化网页抓取 - 更严格的超时控制
         update_progress("web_scrape", "开始网页抓取")
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.8,en;q=0.6",
             "Connection": "close"  # 避免连接池问题
         }
-        
+
         # 使用更严格的超时设置
         session = requests.Session()
         session.trust_env = False  # 避免代理问题
-        
+
         try:
             update_progress("connecting", "建立连接")
             # 进一步优化超时设置
             response = session.get(url, timeout=(2, 4), headers=headers, stream=True)
-            
+
             # 检查状态码
             if response.status_code != 200:
                 update_progress("error", f"HTTP {response.status_code}")
                 return f"【失败 {response.status_code}】{url}"
-            
+
             # 检查内容类型
             content_type = response.headers.get('content-type', '').lower()
-            
+
             # 如果不是文本内容，直接返回
             if not any(t in content_type for t in ['text/html', 'text/plain', 'application/json']):
                 update_progress("error", "非文本内容")
                 return f"【非文本内容】{url}"
-            
+
             update_progress("reading", "读取内容")
-            
+
             # 限制读取大小，防止大文件卡顿
             max_bytes = max_chars * 4  # 为UTF-8预留空间
             text = ""
             bytes_read = 0
-            
+
             for chunk in response.iter_content(chunk_size=1024, decode_unicode=True):
                 if bytes_read > max_bytes:
                     text += "...【内容过大截断】"
@@ -556,9 +542,9 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                 if chunk:
                     text += chunk.decode('utf-8', errors='ignore') if isinstance(chunk, bytes) else chunk
                     bytes_read += len(chunk)
-            
+
             update_progress("processing", "处理HTML")
-            
+
             # 智能HTML内容提取
             if 'text/html' in content_type:
                 # 特殊处理飞书文档 - 检测是否为登录页面
@@ -566,7 +552,7 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                     # 检查是否是登录页面（包含登录相关关键词）
                     login_indicators = ['login', 'signin', '登录', '飞书', 'lark', 'pre-loading', 'global-loading']
                     is_login_page = any(indicator in text.lower() for indicator in login_indicators)
-                    
+
                     if is_login_page:
                         # 如果是登录页面，提供更详细的错误信息
                         update_progress("warning", "飞书文档需登录")
@@ -574,13 +560,13 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                                 "1) 检查API配置是否有效；" \
                                 "2) 在飞书中导出为 docx 文件后上传；" \
                                 "3) 或复制文档内容直接粘贴到文本框中】")
-                
+
                 # 通用HTML内容提取
                 # 1. 移除脚本和样式
                 text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
                 text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
                 text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
-                
+
                 # 2. 提取正文内容（优先提取article、main、content等区域）
                 content_patterns = [
                     r'<article[^>]*>(.*?)</article>',
@@ -589,40 +575,40 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                     r'<div[^>]*id="[^"]*(?:content|main|article|text)[^"]*"[^>]*>(.*?)</div>',
                     r'<body[^>]*>(.*?)</body>'
                 ]
-                
+
                 extracted_text = ""
                 for pattern in content_patterns:
                     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
                     if match:
                         extracted_text = match.group(1)
                         break
-                
+
                 if extracted_text:
                     text = extracted_text
-                
+
                 # 3. 保留段落结构
                 text = re.sub(r'</(p|div|h[1-6]|section|article)>', '\n\n', text, flags=re.IGNORECASE)
-                
+
                 # 4. 移除所有标签，保留文本内容
                 text = re.sub(r'<[^>]+>', ' ', text)
-                
+
                 # 5. 移除多余的空白字符
                 text = re.sub(r'\s+', ' ', text)
                 text = re.sub(r'\n{3,}', '\n\n', text)
                 text = text.strip()
-            
+
             # 进一步截断
             if len(text) > max_chars:
                 text = text[:max_chars] + "...【截断】"
-            
+
             # 针对飞书在线文档的特殊处理
             if ('feishu.cn' in url or 'larksuite' in url):
                 # 检测是否为有效文档内容
                 has_meaningful_content = len(text) > 200 and not re.search(r'css|style|loading|login', text.lower())
-                
+
                 if not has_meaningful_content:
                     update_progress("warning", "飞书文档需登录")
-                    
+
                     # 提供更详细的建议
                     suggestions = [
                         "在飞书客户端中打开文档，然后导出为 docx 文件上传到本系统",
@@ -630,9 +616,9 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                         "如果文档已公开分享，检查分享权限设置",
                         "联系文档所有者获取文档内容"
                     ]
-                    
+
                     suggestion_text = "\n".join([f"{i+1}. {suggestion}" for i, suggestion in enumerate(suggestions)])
-                    
+
                     return (f"【飞书文档访问限制】\n\n"
                             f"检测到该飞书文档需要登录才能访问实际内容。\n"
                             f"当前获取到的是登录页面样式代码，不是文档正文。\n\n"
@@ -642,21 +628,21 @@ def fetch_url_content(url: str, timeout: int = 8, max_chars: int = 8000, progres
                     # 如果是有效内容，进一步清理
                     update_progress("success", "飞书文档内容有效")
                     return text
-            
+
             # 过滤无效内容
             if len(text) < 30 or 'javascript' in text.lower() or 'function' in text.lower():
                 update_progress("error", "内容无效")
                 return f"【内容无效】{url}"
-            
+
             # 性能统计
             elapsed = time.time() - start_time
             update_progress("success", f"完成 ({len(text)}字符, {elapsed:.1f}s)")
-            
+
             return text
-            
+
         finally:
             session.close()
-        
+
     except requests.exceptions.Timeout:
         update_progress("timeout", "连接超时")
         return f"【超时】{url}"
@@ -928,21 +914,21 @@ def extract_req_id(text: str) -> Optional[str]:
 
 # ===== AI大模型需求分析功能 =====
 @handle_errors
-def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temperature: float = 0.2, 
+def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temperature: float = 0.2,
                                 max_tokens: int = 4000) -> List[Dict[str, str]]:
     """使用AI大模型对整个文档进行智能需求分析和分解
-    
+
     Args:
         full_text: 完整的文档文本内容
         base_url: API基础URL
         model: 模型名称
         temperature: 温度参数
         max_tokens: 最大token数
-    
+
     Returns:
         分析后的需求列表，每个需求包含编号、标题、描述等信息
     """
-    
+
     # 智能文本截断，保留重要部分
     if len(full_text) > 12000:
         # 保留开头和结尾的重要部分，中间截断
@@ -951,7 +937,7 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
         truncated_text = f"{first_part}\n... [文档中间部分已截断] ...\n{last_part}"
     else:
         truncated_text = full_text
-    
+
     # 构建智能分析提示词
     analysis_prompt = f"""你是一名专业的软件需求分析师，擅长从技术文档中智能提取和分解需求。
 
@@ -999,19 +985,19 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
     try:
         # 调用AI模型进行分析
         response = call_model(model, analysis_prompt, base_url, temperature)
-        
+
         # 解析JSON响应
         import json
-        
+
         # 清理响应文本，提取JSON部分
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         if json_start >= 0 and json_end > json_start:
             json_text = response[json_start:json_end]
             result = json.loads(json_text)
-            
+
             requirements = result.get('requirements', [])
-            
+
             # 验证和标准化需求数据
             validated_reqs = []
             for req in requirements:
@@ -1019,7 +1005,7 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
                 req_id = req.get('id', '').strip()
                 title = req.get('title', '').strip()
                 description = req.get('description', '').strip()
-                
+
                 if req_id and title and description:
                     # 标准化需求编号
                     if not req_id.startswith('REQ-'):
@@ -1031,7 +1017,7 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
                         category = req.get('category', '功能需求')
                         category_code = category_map.get(category, 'FUNC')
                         req_id = f"REQ-{category_code}-{len(validated_reqs) + 1:03d}"
-                    
+
                     # 标准化优先级
                     priority = req.get('priority', '中').lower()
                     if priority in ['high', '高', 'critical']:
@@ -1040,7 +1026,7 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
                         priority = '中'
                     else:
                         priority = '低'
-                    
+
                     validated_reqs.append({
                         'id': req_id,
                         'title': title,
@@ -1053,31 +1039,31 @@ def analyze_requirements_with_ai(full_text: str, base_url: str, model: str, temp
                         'test_scenarios': req.get('test_scenarios', []),
                         'acceptance_criteria': req.get('acceptance_criteria', [])
                     })
-            
+
             return validated_reqs
         else:
             st.warning("AI分析结果格式异常，回退到传统识别方法")
             return []
-            
+
     except Exception as e:
         st.error(f"AI需求分析失败: {e}")
         return []
 
 @handle_errors
-def intelligent_requirement_decomposition(requirement_text: str, base_url: str, model: str, 
+def intelligent_requirement_decomposition(requirement_text: str, base_url: str, model: str,
                                         temperature: float = 0.2) -> List[Dict[str, str]]:
     """智能需求分解 - 将复杂需求分解为可测试的子需求
-    
+
     Args:
         requirement_text: 单个需求文本
         base_url: API基础URL
         model: 模型名称
         temperature: 温度参数
-    
+
     Returns:
         分解后的子需求列表
     """
-    
+
     decomposition_prompt = f"""你是一名专业的测试工程师，擅长将复杂需求分解为可测试的子需求。
 
 请将以下复杂需求分解为可独立测试的原子需求：
@@ -1111,39 +1097,39 @@ def intelligent_requirement_decomposition(requirement_text: str, base_url: str, 
 
     try:
         response = call_model(model, decomposition_prompt, base_url, temperature)
-        
+
         import json
         json_start = response.find('{')
         json_end = response.rfind('}') + 1
         if json_start >= 0 and json_end > json_start:
             json_text = response[json_start:json_end]
             result = json.loads(json_text)
-            
+
             sub_requirements = result.get('sub_requirements', [])
             return sub_requirements
         else:
             return []
-            
+
     except Exception as e:
         st.error(f"智能需求分解失败: {e}")
         return []
 
 @handle_errors
-def batch_requirement_analysis(documents: List[str], base_url: str, model: str, 
+def batch_requirement_analysis(documents: List[str], base_url: str, model: str,
                              temperature: float = 0.2, batch_size: int = 5) -> Dict[str, Any]:
     """批量需求分析 - 对多个文档进行智能分析
-    
+
     Args:
         documents: 文档文本列表
         base_url: API基础URL
         model: 模型名称
         temperature: 温度参数
         batch_size: 批量处理大小
-    
+
     Returns:
         分析结果统计和需求列表
     """
-    
+
     all_requirements = []
     analysis_stats = {
         'total_documents': len(documents),
@@ -1153,44 +1139,44 @@ def batch_requirement_analysis(documents: List[str], base_url: str, model: str,
         'by_testability': {'是': 0, '否': 0},
         'processing_time': 0
     }
-    
+
     start_time = time.time()
-    
+
     # 分批处理文档
     for i in range(0, len(documents), batch_size):
         batch_docs = documents[i:i + batch_size]
-        
+
         for doc in batch_docs:
             try:
                 requirements = analyze_requirements_with_ai(doc, base_url, model, temperature)
                 all_requirements.extend(requirements)
-                
+
                 # 更新统计信息
                 for req in requirements:
                     analysis_stats['total_requirements'] += 1
-                    
+
                     # 按类别统计
                     category = req.get('category', '其他')
                     analysis_stats['by_category'][category] = analysis_stats['by_category'].get(category, 0) + 1
-                    
+
                     # 按优先级统计
                     priority = req.get('priority', '中')
                     analysis_stats['by_priority'][priority] = analysis_stats['by_priority'].get(priority, 0) + 1
-                    
+
                     # 按可测试性统计
                     testable = req.get('testable', '是')
                     analysis_stats['by_testability'][testable] = analysis_stats['by_testability'].get(testable, 0) + 1
-                    
+
             except Exception as e:
                 st.warning(f"文档分析失败: {e}")
                 continue
-        
+
         # 批量处理间隔
         if i + batch_size < len(documents):
             time.sleep(0.1)
-    
+
     analysis_stats['processing_time'] = time.time() - start_time
-    
+
     return {
         'requirements': all_requirements,
         'statistics': analysis_stats
@@ -1200,9 +1186,9 @@ def extract_text_from_file(uploaded_file) -> str:
     """从上传的文件中提取文本内容"""
     if uploaded_file is None:
         return ""
-    
+
     name = uploaded_file.name.lower()
-    
+
     if name.endswith('.pdf'):
         try:
             from PyPDF2 import PdfReader
@@ -1214,21 +1200,21 @@ def extract_text_from_file(uploaded_file) -> str:
         except Exception as e:
             st.error(f"PDF文本提取失败: {e}")
             return ""
-    
+
     elif name.endswith('.docx'):
         try:
             return read_word(uploaded_file)
         except Exception as e:
             st.error(f"Word文本提取失败: {e}")
             return ""
-    
+
     elif name.endswith(('.txt', '.md')):
         try:
             return StringIO(uploaded_file.getvalue().decode("utf-8")).read()
         except Exception as e:
             st.error(f"文本文件读取失败: {e}")
             return ""
-    
+
     elif name.endswith('.xlsx'):
         try:
             sheets = read_excel(uploaded_file)
@@ -1242,7 +1228,7 @@ def extract_text_from_file(uploaded_file) -> str:
         except Exception as e:
             st.error(f"Excel文本提取失败: {e}")
             return ""
-    
+
     else:
         st.warning("不支持的文件类型")
         return ""
@@ -1253,17 +1239,25 @@ def identify_requirements_with_ai(full_text: str, source_name: str) -> List[str]
         # 检查是否有API配置
         api_key = API_KEY  # 使用硬编码的API Key
         base_url = DEFAULT_BASE_URL
-        
+
         if not api_key:
             st.warning("未配置API Key，无法使用AI需求识别")
             return []
-        
+
         # 创建AI客户端
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        
+        import uuid
+        client = OpenAI(
+            api_key=api_key,
+            base_url=str(base_url or "").rstrip("/") + "/v1",
+            default_headers={
+                "X-Model-Provider-Id": "xiaomi",
+                "X-Model-Request-Id": str(uuid.uuid4()),
+            },
+        )
+
         # 构建提示词
         prompt = f"""请从以下文档内容中识别出所有的软件需求。文档来源：{source_name}
-        
+
 {full_text[:4000]}  # 限制文本长度避免token超限
 
 请按照以下要求识别需求：
@@ -1282,7 +1276,7 @@ def identify_requirements_with_ai(full_text: str, source_name: str) -> List[str]
 }}
 
 请只返回JSON格式，不要有其他内容。"""
-        
+
         response = client.chat.completions.create(
             model="MiMo-7B-RL",  # 使用免费模型
             messages=[
@@ -1291,24 +1285,24 @@ def identify_requirements_with_ai(full_text: str, source_name: str) -> List[str]
             ],
             temperature=0.3
         )
-        
+
         result_text = response.choices[0].message.content
-        
+
         # 解析结果
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             result = json.loads(json_match.group())
             requirements = result.get("requirements", [])
-            
+
             # 过滤空需求和过短需求
-            filtered_reqs = [req.strip() for req in requirements 
+            filtered_reqs = [req.strip() for req in requirements
                            if req.strip() and len(req.strip()) > MIN_PARAGRAPH_LENGTH]
-            
+
             return filtered_reqs
         else:
             st.warning("AI需求识别返回格式不正确")
             return []
-            
+
     except Exception as e:
         logger.error(f"AI需求识别失败 ({source_name}): {e}")
         st.warning(f"AI需求识别失败: {str(e)}")
@@ -1341,7 +1335,7 @@ def process_single_document_with_progress(url, progress_bar=None, status_text=No
             }
             progress = progress_map.get(step, 0)
             progress_bar.progress(progress)
-            
+
             # 状态显示
             status_map = {
                 "start": "开始处理文档",
@@ -1355,35 +1349,47 @@ def process_single_document_with_progress(url, progress_bar=None, status_text=No
             }
             display_status = status_map.get(step, step)
             status_text.text(f"{display_status}... ({elapsed:.1f}s)")
-    
+
     import time
     start_time = time.time()
-    
+
     # 如果是飞书文档，优先使用API
     if 'feishu.cn' in url or 'larksuite' in url:
         progress_callback("feishu_api", "使用飞书API", time.time() - start_time)
         try:
-            content = fetch_feishu_document(url, debug=st.session_state.get("debug_mode", False))
-            
-            # 检查API调用是否成功
-            if content and not content.startswith("【飞书API错误】"):
-                progress_callback("success", "完成", time.time() - start_time)
-                return content  # API成功，立即返回
+            # 检查是否为表格
+            if "/sheets/" in url or "sheet=" in url:
+                # 对于表格，直接调用 fetch_feishu_document，它现在已经支持表格了
+                content = fetch_feishu_document(url, debug=st.session_state.get("debug_mode", False))
+                if content and not content.startswith("【飞书API错误】"):
+                    progress_callback("success", "完成", time.time() - start_time)
+                    return content
+                else:
+                    # API调用失败，回退到网页抓取
+                    progress_callback("fallback", "备用方案", time.time() - start_time)
             else:
-                # API调用失败，回退到网页抓取
-                progress_callback("fallback", "备用方案", time.time() - start_time)
-                # 继续执行到网页抓取
+                # 普通文档
+                content = fetch_feishu_document(url, debug=st.session_state.get("debug_mode", False))
+
+                # 检查API调用是否成功
+                if content and not content.startswith("【飞书API错误】"):
+                    progress_callback("success", "完成", time.time() - start_time)
+                    return content  # API成功，立即返回
+                else:
+                    # API调用失败，回退到网页抓取
+                    progress_callback("fallback", "备用方案", time.time() - start_time)
+                    # 继续执行到网页抓取
         except Exception as e:
             progress_callback("fallback", "备用方案", time.time() - start_time)
             # 继续执行到网页抓取
-    
+
     # 使用网页抓取作为备选方案
     progress_callback("web_scrape", "网页抓取", time.time() - start_time)
-    
+
     def web_progress_callback(url, step, status, elapsed):
         """网页抓取进度回调包装器"""
         progress_callback(step if step != "start" else "web_scrape", status, elapsed)
-    
+
     return fetch_url_content(url, progress_callback=web_progress_callback)
 
 # ===== 动态用例数量分配 =====
@@ -1565,7 +1571,6 @@ def call_model(model: str, prompt: str, base_url: str, temperature: float = 0.2)
                 {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
-            "max_tokens": 2000,
         }
 
     def _completions_payload() -> dict:
@@ -1573,7 +1578,6 @@ def call_model(model: str, prompt: str, base_url: str, temperature: float = 0.2)
             "model": actual_model,
             "prompt": "你是测试用例生成助手，严格输出 CSV。\n" + prompt,
             "temperature": temperature,
-            "max_tokens": 2000,
         }
 
     def _do_request(url: str, payload: dict) -> requests.Response:
@@ -1856,12 +1860,12 @@ def setup_sidebar() -> Tuple[str, str, float, List[str], int, int, int, bool, Di
             raw_urls = [u.strip() for u in url_text.splitlines() if u.strip()]
             valid_urls = [u for u in raw_urls if _is_valid_url(u)]
             bad_urls = [u for u in raw_urls if u and u not in valid_urls]
-            
+
             if valid_urls:
                 # 创建进度显示区域 - 简化显示
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
+
                 def progress_callback(url, step, status, elapsed, current=None, total=None):
                     """优化进度回调函数"""
                     if total:
@@ -1883,20 +1887,20 @@ def setup_sidebar() -> Tuple[str, str, float, List[str], int, int, int, bool, Di
                         status_text.text(f"[{current}/{total}] {display_step}: {status} ({elapsed:.1f}s)")
                     else:
                         status_text.text(f"处理中: {status} ({elapsed:.1f}s)")
-                
+
                 # 使用批量处理
                 with st.spinner(f"正在抓取 {len(valid_urls[:8])} 个链接..."):
                     # 增加超时时间到 100 秒，以适应大型飞书文档
                     batch_results = process_urls_batch(valid_urls[:8], timeout=100, progress_callback=progress_callback)
                     fetched = [(url, content) for url, content in batch_results.items()]
-                
+
                 # 显示结果统计
                 success_count = sum(1 for _, content in fetched if not content.startswith("【"))
-                
+
                 # 清理进度显示
                 progress_bar.empty()
                 status_text.empty()
-                
+
                 st.session_state['background_urls'] = valid_urls
                 st.session_state['background_urls_content'] = fetched
                 if bad_urls:
@@ -2003,13 +2007,13 @@ def get_enhanced_background_knowledge() -> str:
 
 def main():
     st.set_page_config(page_title="AI 测试用例生成器 (完整)", layout="wide")
-    
+
     # Set a flag to indicate credentials are available
     st.session_state['feishu_credentials_available'] = True
 
     st.title("AI 测试用例生成器 - 电力电子")
     base_url, model, temperature, headers, pos_n, neg_n, edge_n, auto_mode, dyn_params = setup_sidebar()
-    tab1, tab2, tab3 = st.tabs(["单条需求", "批量处理", "帮助"])
+    tab1, tab2, tab3, tab_script_check, tab4, tab5 = st.tabs(["单条需求", "批量处理", "覆盖度与优化", "脚本校验", "思维导图", "帮助"])
     with tab1:
         st.subheader("单条需求生成")
         templates = get_requirement_templates(); opts = ["自定义"] + list(templates.keys())
@@ -2188,7 +2192,7 @@ def main():
                 st.session_state.pdf_processed = False
                 st.session_state.pdf_requirements = []
                 st.session_state.current_pdf_file = current_file_name
-            
+
             if uploaded.name.lower().endswith('.xlsx'):
                 sheets = read_excel(uploaded)
                 if sheets:
@@ -2207,71 +2211,79 @@ def main():
                     text = ""
                     for page in pdf.pages:
                         text += page.extract_text() + "\n"
-                    
+
                     if text.strip():
                         # 初始化PDF处理状态
                         if 'pdf_processed' not in st.session_state:
                             st.session_state.pdf_processed = False
                         if 'pdf_requirements' not in st.session_state:
                             st.session_state.pdf_requirements = []
-                        
+
                         # PDF文档AI分解选项
                         st.markdown("#### PDF文档AI智能分解")
                         col_pdf1, col_pdf2 = st.columns(2)
                         with col_pdf1:
-                            enable_pdf_ai = st.checkbox("启用PDF AI分解", value=True, 
+                            enable_pdf_ai = st.checkbox("启用PDF AI分解", value=True,
                                                       help="使用AI智能分解PDF文档中的需求",
                                                       key="enable_pdf_ai")
                         with col_pdf2:
                             # 分解条件配置
-                            decomposition_condition = st.text_input("分解条件（可选）", 
+                            decomposition_condition = st.text_input("分解条件（可选）",
                                                                    placeholder="例如：按功能模块、按优先级、按复杂度等",
                                                                    key="decomposition_condition")
-                        
+
                         # 默认使用传统方法提取需求
                         parts = re.split(r"\n\s*\n+", text.strip())
                         pdf_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
-                        
+
                         # 如果还没有处理过PDF，或者用户重新上传了文件，使用传统方法
                         if not st.session_state.pdf_processed:
                             st.session_state.pdf_requirements = pdf_reqs
                             st.session_state.pdf_processed = True
-                        
+
                         if enable_pdf_ai:
                             # 显示AI分解选项
                             if st.button("🔍 AI分解PDF需求"):
                                 with st.spinner("AI正在分解PDF文档需求..."):
                                     try:
                                         # 使用AI进行PDF文档需求分解
-                                        client = OpenAI(api_key=API_KEY, base_url=DEFAULT_BASE_URL)
+                                        import uuid
+                                        client = OpenAI(
+                                            api_key=API_KEY,
+                                            base_url=str(DEFAULT_BASE_URL or "").rstrip("/") + "/v1",
+                                            default_headers={
+                                                "X-Model-Provider-Id": "xiaomi",
+                                                "X-Model-Request-Id": str(uuid.uuid4()),
+                                            },
+                                        )
                                         ai_processor = AIRequirementProcessor(client)
-                                        
+
                                         # 根据用户输入的分解条件构建提示词
                                         condition_prompt = ""
                                         if decomposition_condition.strip():
                                             condition_prompt = f"请按照以下条件进行需求分解：{decomposition_condition}"
-                                        
+
                                         # 分析PDF文档
                                         analyzed_reqs = ai_processor.process_pdf_requirements(text, uploaded.name, condition_prompt)
-                                        
+
                                         if analyzed_reqs:
                                             st.success(f"✅ AI智能分解出 {len(analyzed_reqs)} 条高质量需求")
-                                            
+
                                             # 显示分解统计
                                             with st.expander("📊 PDF分解统计"):
                                                 categories = {}
                                                 priorities = {}
                                                 complexities = {}
-                                                
+
                                                 for req in analyzed_reqs:
                                                     cat = req.get('type', '未知')
                                                     pri = req.get('priority', '中')
                                                     comp = req.get('complexity', '中等')
-                                                    
+
                                                     categories[cat] = categories.get(cat, 0) + 1
                                                     priorities[pri] = priorities.get(pri, 0) + 1
                                                     complexities[comp] = complexities.get(comp, 0) + 1
-                                                
+
                                                 col1, col2 = st.columns(2)
                                                 with col1:
                                                     st.write("**需求类别**")
@@ -2284,7 +2296,7 @@ def main():
                                                     st.write("**复杂度**")
                                                     for comp, count in complexities.items():
                                                         st.write(f"- {comp}: {count}")
-                                            
+
                                             # 显示AI分解的需求预览
                                             with st.expander("🔍 AI分解需求预览"):
                                                 for i, req in enumerate(analyzed_reqs[:15]):  # 显示前15条
@@ -2292,7 +2304,7 @@ def main():
                                                     st.write(f"   优先级: {req.get('priority', '中')} | 复杂度: {req.get('complexity', '中等')}")
                                                     st.write(f"   描述: {req.get('sub_requirement', req.get('original_requirement', ''))[:200]}...")
                                                     st.divider()
-                                            
+
                                             # 使用AI分解的需求更新session状态
                                             ai_pdf_reqs = [req.get('sub_requirement', req.get('original_requirement', '')) for req in analyzed_reqs]
                                             st.session_state.pdf_requirements = ai_pdf_reqs
@@ -2301,18 +2313,18 @@ def main():
                                         else:
                                             # AI分解失败，保持传统方法
                                             st.warning("AI分解失败，使用传统方法处理")
-                                        
+
                                     except Exception as e:
                                         st.warning(f"PDF AI分解失败，使用传统方法: {e}")
-                            
+
                         # 使用session状态中的需求
                         collected.extend(st.session_state.pdf_requirements)
                         source_counts.append(f"PDF:{len(st.session_state.pdf_requirements)}")
-                        
+
                         # 显示PDF AI分析结果（如果已完成）
                         if st.session_state.get('pdf_ai_analysis_completed', False):
                             st.success("✅ PDF AI分解已完成")
-                            
+
                             # 显示PDF内容预览
                             with st.expander("PDF内容预览"):
                                 st.text(text[:500] + ("..." if len(text) > 500 else ""))
@@ -2322,7 +2334,7 @@ def main():
                                 st.text(text[:500] + ("..." if len(text) > 500 else ""))
                     else:
                         st.warning("PDF文件内容为空或无法提取文本")
-                        
+
                 except ImportError:
                     st.error("PDF处理需要安装 PyPDF2 库。请运行: pip install PyPDF2")
                 except Exception as e:
@@ -2334,7 +2346,7 @@ def main():
                     word_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
                     collected.extend(word_reqs)
                     source_counts.append(f"Word:{len(word_reqs)}")
-            
+
             # 处理HTML文件
             elif uploaded.name.lower().endswith('.html'):
                 try:
@@ -2342,13 +2354,13 @@ def main():
                     # 提取HTML文本内容
                     text_content = re.sub(r'<[^>]+>', ' ', html_content)
                     text_content = re.sub(r'\\s+', ' ', text_content)
-                    
+
                     if text_content.strip():
                         parts = re.split(r"\n\s*\n+", text_content.strip())
                         html_reqs = [p for p in parts if len(p.strip()) > MIN_PARAGRAPH_LENGTH]
                         collected.extend(html_reqs)
                         source_counts.append(f"HTML:{len(html_reqs)}")
-                        
+
                         # 显示HTML内容预览
                         with st.expander("HTML内容预览"):
                             st.text(text_content[:500] + ("..." if len(text_content) > 500 else ""))
@@ -2368,7 +2380,7 @@ def main():
         st.divider()
         # 3. 网页链接 -> 需求提取 (简单按段落拆分)
         st.markdown("**网页链接 (需求来源)**")
-        
+
         # 单个文档处理
         col1, col2 = st.columns([2, 1])
         with col1:
@@ -2378,10 +2390,10 @@ def main():
                 st.info("💡 **飞书文档提示**: 已配置API自动获取，如遇问题可导出为docx文件或复制内容直接粘贴。")
         with col2:
             process_single = st.button("🔍 处理单个文档", type="primary")
-        
+
         st.markdown("**批量链接处理 (每行一个 URL)**")
         url_require_text = st.text_area("需求链接列表", placeholder="https://example.com/page1\nhttps://example.com/page2", height=110, key="req_url_box")
-        
+
         # 单个文档处理
         if process_single and single_url:
             if _is_valid_url(single_url):
@@ -2389,15 +2401,15 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 result_text = st.empty()
-                
+
                 # 使用单个文档处理函数
                 with st.spinner("正在处理单个文档..."):
                     content = process_single_document_with_progress(single_url, progress_bar, status_text)
-                
+
                 # 清理进度显示
                 progress_bar.empty()
                 status_text.empty()
-                
+
                 if content and not content.startswith("【"):
                     # 使用统一的需求提取函数
                     seg_clean = process_requirements_from_text(content)
@@ -2423,20 +2435,20 @@ def main():
                         result_text.error(f"❌ 文档处理失败: 未知错误")
             else:
                 st.warning("请输入有效的URL链接")
-        
+
         # 批量链接处理
         fetch_req_urls = st.button("批量抓取链接需求")
         if fetch_req_urls:
             raw_urls = [u.strip() for u in url_require_text.splitlines() if u.strip()]
             valid_urls = [u for u in raw_urls if _is_valid_url(u)]
             fetched_req = []
-            
+
             if valid_urls:
                 # 创建进度显示区域 - 简化显示
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 result_text = st.empty()
-                
+
                 def progress_callback(url, step, status, elapsed, current=None, total=None):
                     """优化进度回调函数"""
                     if total:
@@ -2458,7 +2470,7 @@ def main():
                         status_text.text(f"需求抓取 [{current}/{total}]: {display_step} ({elapsed:.1f}s)")
                     else:
                         status_text.text(f"需求抓取: {status} ({elapsed:.1f}s)")
-                
+
                 # 使用批量处理
                 with st.spinner(f"正在抓取 {len(valid_urls[:6])} 个需求链接..."):
                     # 增加超时时间到 100 秒
@@ -2505,7 +2517,7 @@ def main():
                 for i, rtxt in enumerate(st.session_state['single_doc_requirements'][:20]):
                     st.write(f"{i+1}. {rtxt[:160]}{'...' if len(rtxt)>160 else ''}")
             collected.extend(st.session_state['single_doc_requirements'])
-        
+
         # 批量链接需求
         if st.session_state.get('batch_url_requirements'):
             url_count = len(st.session_state['batch_url_requirements'])
@@ -2533,19 +2545,19 @@ def main():
             pdf_reqs = st.session_state.pdf_requirements
             if not any(req in st.session_state.batch_requirements for req in pdf_reqs):
                 st.session_state.batch_requirements.extend(pdf_reqs)
-        
+
         if 'selected_requirements' not in st.session_state:
             st.session_state.selected_requirements = list(range(len(st.session_state.batch_requirements)))
         if 'user_commands' not in st.session_state:
             st.session_state.user_commands = ""
-        
+
         # 需求筛选和编辑功能
         col1, col2 = st.columns([3, 1])
-        
+
         with col1:
             # 搜索框
             search_term = st.text_input("🔍 搜索需求", placeholder="输入关键词筛选需求...", key="search_requirements_batch")
-            
+
             # 需求列表展示
             # 使用带索引的列表以处理重复需求内容的情况
             all_reqs_with_idx = list(enumerate(st.session_state.batch_requirements))
@@ -2588,19 +2600,19 @@ def main():
 
             # 更新选中的需求索引
             st.session_state.selected_requirements = list(current_selected)
-        
+
         with col2:
             st.write("**批量操作**")
-            
+
             # 选择操作
             if st.button("✅ 全选"):
                 st.session_state.selected_requirements = list(range(len(st.session_state.batch_requirements)))
                 st.rerun()
-            
+
             if st.button("❌ 清空选择"):
                 st.session_state.selected_requirements = []
                 st.rerun()
-            
+
             # 删除选中
             if st.button("🗑️ 删除选中"):
                 if st.session_state.selected_requirements:
@@ -2610,20 +2622,20 @@ def main():
                             st.session_state.batch_requirements.pop(idx)
                     st.session_state.selected_requirements = []
                     st.rerun()
-            
+
             # 添加新需求
             new_req = st.text_area("➕ 添加新需求", height=80, placeholder="输入新的需求描述...")
             if st.button("添加") and new_req.strip():
                 st.session_state.batch_requirements.append(new_req.strip())
                 st.rerun()
-        
+
         # 用户命令交互区域
         st.divider()
         st.subheader("💬 用户命令交互")
-        
+
         col_cmd1, col_cmd2 = st.columns([3, 1])
         with col_cmd1:
-            user_cmd = st.text_area("输入命令", value=st.session_state.user_commands, 
+            user_cmd = st.text_area("输入命令", value=st.session_state.user_commands,
                                   placeholder="例如：删除包含'测试'的需求，合并相似需求，添加编号前缀等...",
                                   height=100)
         with col_cmd2:
@@ -2633,30 +2645,30 @@ def main():
             st.write("• `添加前缀 前缀`")
             st.write("• `合并相似`")
             st.write("• `清理重复`")
-            
+
             if st.button("执行命令"):
                 if user_cmd.strip():
                     st.session_state.user_commands = user_cmd
                     _process_user_commands(user_cmd)
                     st.rerun()
-        
+
         # 阶段2：AI智能分析（在用户编辑之后）
         st.divider()
         st.subheader("🤖 AI需求智能分析（可选）")
-        
+
         col_ai1, col_ai2 = st.columns(2)
         with col_ai1:
-            enable_ai_analysis = st.checkbox("启用AI需求分析", value=True, 
+            enable_ai_analysis = st.checkbox("启用AI需求分析", value=True,
                                            help="使用AI自动识别需求类型、优先级和复杂度",
                                            key="enable_ai_analysis_batch")
         with col_ai2:
             enable_ai_decomposition = st.checkbox("启用AI需求分解", value=True,
                                                 help="自动将复杂需求分解为可测试的子需求",
                                                 key="enable_ai_decomposition_batch")
-        
+
         processed_reqs = st.session_state.batch_requirements.copy()
         ai_analysis_results = None
-        
+
         if enable_ai_analysis and st.session_state.batch_requirements:
             if st.button("🔍 开始AI分析"):
                 with st.spinner("AI正在分析需求..."):
@@ -2666,7 +2678,15 @@ def main():
                                     if req.strip() and len(req.strip()) > MIN_PARAGRAPH_LENGTH]
 
                         # 使用AI进行需求识别和分解
-                        client = OpenAI(api_key=API_KEY, base_url=DEFAULT_BASE_URL)
+                        import uuid
+                        client = OpenAI(
+                            api_key=API_KEY,
+                            base_url=str(DEFAULT_BASE_URL or "").rstrip("/") + "/v1",
+                            default_headers={
+                                "X-Model-Provider-Id": "xiaomi",
+                                "X-Model-Request-Id": str(uuid.uuid4()),
+                            },
+                        )
                         ai_processor = AIRequirementProcessor(client)
 
                         # 分析需求
@@ -2676,37 +2696,37 @@ def main():
                             # 保存AI分析结果到session状态
                             st.session_state.ai_analysis_results = analyzed_reqs
                             st.session_state.ai_analysis_completed = True
-                            
+
                             # 替换为AI识别的需求
                             processed_reqs = [req.get('sub_requirement', req.get('original_requirement', '')) for req in analyzed_reqs]
                             st.session_state.batch_requirements = processed_reqs
-                            
+
                             # 重置选择状态，选择所有新需求
                             st.session_state.selected_requirements = list(range(len(processed_reqs)))
-                            
+
                             st.success(f"✅ AI智能识别出 {len(analyzed_reqs)} 条高质量需求")
                             st.rerun()
-                        
+
                     except Exception as e:
                         st.warning(f"AI需求分析失败，使用传统方法: {e}")
-        
+
         # 显示AI分析结果（如果已完成）
         if st.session_state.get('ai_analysis_completed', False) and st.session_state.get('ai_analysis_results'):
             analyzed_reqs = st.session_state.ai_analysis_results
-            
+
             # 显示分析统计
             with st.expander("📊 AI分析统计"):
                 categories = {}
                 priorities = {}
                 complexities = {}
                 decomposition_stats = {'已分解': 0, '未分解': 0}
-                
+
                 for req in analyzed_reqs:
                     cat = req.get('type', '未知')
                     pri = req.get('priority', '中')
                     comp = req.get('complexity', '中等')
                     is_decomposed = req.get('is_decomposed', False)
-                    
+
                     categories[cat] = categories.get(cat, 0) + 1
                     priorities[pri] = priorities.get(pri, 0) + 1
                     complexities[comp] = complexities.get(comp, 0) + 1
@@ -2714,7 +2734,7 @@ def main():
                         decomposition_stats['已分解'] += 1
                     else:
                         decomposition_stats['未分解'] += 1
-                
+
                 col1, col2 = st.columns(2)
                 with col1:
                     st.write("**需求类别**")
@@ -2730,7 +2750,7 @@ def main():
                     st.write("**分解状态**")
                     for stat, count in decomposition_stats.items():
                         st.write(f"- {stat}: {count}")
-            
+
             # 显示AI识别的需求详情与筛选
             st.markdown("### 🧬 AI分析结果详情与筛选")
 
@@ -2800,28 +2820,28 @@ def main():
                         meta += " (已分解)"
                     st.markdown(f"{meta}\n\n{content}")
                     st.divider()
-        
+
         # 阶段3：最终确认和生成
         st.divider()
         st.subheader("🚀 最终确认和生成")
-        
+
         # 显示当前需求统计
         st.info(f"当前需求数量: {len(st.session_state.batch_requirements)} 条")
-        
+
         # 最终需求统计
         final_reqs = st.session_state.batch_requirements
         if st.session_state.selected_requirements:
-            final_reqs = [st.session_state.batch_requirements[i] 
-                        for i in st.session_state.selected_requirements 
+            final_reqs = [st.session_state.batch_requirements[i]
+                        for i in st.session_state.selected_requirements
                         if i < len(st.session_state.batch_requirements)]
-        
+
         st.success(f"✅ 准备生成测试用例的需求数量: {len(final_reqs)} 条")
-        
+
         # 显示最终需求预览
         with st.expander("📋 最终需求预览"):
             for i, req in enumerate(final_reqs[:20]):  # 显示前20条
                 st.write(f"**{i+1}.** {req[:150]}{'...' if len(req) > 150 else ''}")
-        
+
         # 批量生成按钮
         if final_reqs:
             if st.button("🚀 批量生成测试用例"):
@@ -2845,6 +2865,612 @@ def main():
         else:
             st.warning("请先上传文件或输入需求内容")
     with tab3:
+        st.subheader("📊 覆盖度分析与优化")
+        st.markdown("在此页面，您可以上传现有的测试用例（飞书文档/表格），系统将自动分析其对当前需求的覆盖情况，并提供补全和优化建议。")
+
+        # 1. 输入现有用例
+        st.markdown("#### 1. 导入现有测试用例")
+
+        # Excel 文件上传选项
+        st.markdown("##### 📊 上传 Excel 文件")
+        uploaded_file = st.file_uploader("上传 Excel 文件 (.xlsx, .xls)", type=['xlsx', 'xls'], key="excel_upload")
+
+        if uploaded_file is not None:
+            # 获取 Excel 文件中的所有 sheet 名称
+            from helper_functions import get_excel_sheet_names
+            sheet_names = get_excel_sheet_names(uploaded_file)
+
+            if sheet_names:
+                selected_sheet = st.selectbox("选择要读取的 Sheet", ["全部"] + sheet_names, key="sheet_selector")
+
+                if st.button("📥 读取 Excel 文件"):
+                    with st.spinner("正在读取 Excel 文件..."):
+                        from helper_functions import read_excel_file
+
+                        # 重置文件指针到开头
+                        uploaded_file.seek(0)
+
+                        if selected_sheet == "全部":
+                            content = read_excel_file(uploaded_file, sheet_name=None)
+                        else:
+                            content = read_excel_file(uploaded_file, sheet_name=selected_sheet)
+
+                        if content and not content.startswith("Excel文件读取失败"):
+                            from coverage_analyzer import parse_markdown_table_to_df
+                            df = parse_markdown_table_to_df(content)
+                            if not df.empty:
+                                st.session_state.existing_cases_df = df
+                                st.success(f"✅ 成功读取 {len(df)} 条现有用例")
+                                st.dataframe(df.head())
+                            else:
+                                st.warning("未能从 Excel 内容中解析出表格数据。")
+                        else:
+                            st.error(f"Excel 文件读取失败: {content}")
+            else:
+                st.warning("Excel 文件中没有找到任何 sheet")
+
+        st.markdown("##### 🔗 或输入飞书链接")
+        existing_cases_url = st.text_input("现有用例飞书链接 (文档或表格)", placeholder="https://mi.feishu.cn/sheets/...", key="existing_cases_url")
+
+        if 'existing_cases_df' not in st.session_state:
+            st.session_state.existing_cases_df = None
+
+        if st.button("📥 读取现有用例"):
+            if not existing_cases_url:
+                st.warning("请输入链接")
+            else:
+                with st.spinner("正在读取现有用例..."):
+                    # 复用 process_single_document_with_progress 获取内容
+                    # 注意：这里我们需要获取表格内容，process_single_document_with_progress 已经支持
+                    # 但我们需要将其解析为 DataFrame
+
+                    # 创建临时进度条
+                    pb = st.progress(0)
+                    stt = st.empty()
+
+                    # For Sheets links, avoid falling back to web scraping (which often hits login pages).
+                    if "/sheets/" in existing_cases_url:
+                        content = fetch_feishu_document(existing_cases_url, debug=st.session_state.get("debug_mode", False))
+                    else:
+                        content = process_single_document_with_progress(existing_cases_url, pb, stt)
+
+                    pb.empty(); stt.empty()
+
+                    if content and not content.startswith("【"):
+                        df = parse_markdown_table_to_df(content)
+                        if not df.empty:
+                            st.session_state.existing_cases_df = df
+                            st.success(f"✅ 成功读取 {len(df)} 条现有用例")
+                            st.dataframe(df.head())
+                        else:
+                            st.warning("未能从内容中解析出表格数据。")
+                            if "/sheets/" in existing_cases_url:
+                                st.info("检测到飞书表格链接，但当前环境可能无法通过 API 读取单元格数据。建议：在飞书中导出为 Excel 后上传。")
+                    else:
+                        st.error(f"读取失败: {content}")
+                        if "/sheets/" in existing_cases_url and content and "404" in content:
+                            st.info("可行替代方案：1) 飞书表格导出为 Excel 后上传；2) 复制表格内容粘贴；3) 联系管理员开通/放通 Sheets values 读取接口。")
+
+        # 2. 覆盖度分析
+        st.divider()
+        st.markdown("#### 2. 覆盖度分析")
+
+        # 获取当前批量处理中的需求
+        current_requirements = st.session_state.get('batch_requirements', [])
+        if st.session_state.get('selected_requirements'):
+            current_requirements = [current_requirements[i] for i in st.session_state.selected_requirements if i < len(current_requirements)]
+
+        if not current_requirements:
+            st.info("请先在【批量处理】标签页中导入并选择需求。")
+        elif st.session_state.existing_cases_df is None:
+            st.info("请先导入现有测试用例。")
+        else:
+            if st.button("🔍 开始分析覆盖度"):
+                with st.spinner("正在分析需求与用例的关联..."):
+                    analysis_df = map_cases_to_requirements(current_requirements, st.session_state.existing_cases_df)
+                    st.session_state.coverage_analysis = analysis_df
+                    st.success("分析完成！")
+
+        # 3. 结果展示与操作
+        if st.session_state.get('coverage_analysis') is not None:
+            analysis_df = st.session_state.coverage_analysis
+
+            # 统计概览
+            total_reqs = len(analysis_df)
+            uncovered = len(analysis_df[analysis_df['覆盖状态'] == '未覆盖'])
+            insufficient = len(analysis_df[analysis_df['覆盖状态'] == '覆盖不足'])
+            good = len(analysis_df[analysis_df['覆盖状态'] == '覆盖良好'])
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("未覆盖需求", uncovered, delta_color="inverse")
+            c2.metric("覆盖不足需求", insufficient, delta_color="off")
+            c3.metric("覆盖良好需求", good)
+
+            st.dataframe(analysis_df, use_container_width=True)
+
+            # 4. 补全与优化
+            st.divider()
+            st.markdown("#### 3. 优化行动")
+
+            col_act1, col_act2 = st.columns(2)
+
+            with col_act1:
+                st.markdown("##### 🛠️ 补全缺失用例")
+                st.caption("为【未覆盖】和【覆盖不足】的需求自动生成补充用例。")
+                if st.button("生成补充用例"):
+                    # 筛选需要补充的需求
+                    targets = analysis_df[analysis_df['覆盖状态'] != '覆盖良好']
+                    if targets.empty:
+                        st.success("所有需求覆盖良好，无需补充！")
+                    else:
+                        with st.spinner(f"正在为 {len(targets)} 条需求生成补充用例..."):
+                            from coverage_analyzer import generate_gap_cases
+                            new_cases = []
+                            progress_bar = st.progress(0)
+
+                            for i, (idx, row) in enumerate(targets.iterrows()):
+                                req_content = row['需求内容']
+                                # 简单的策略：缺啥补啥
+                                missing = []
+                                if row['正向用例'] == 0: missing.append("正向")
+                                if row['异常用例'] == 0: missing.append("异常")
+                                if row['边界用例'] == 0: missing.append("边界")
+
+                                # 获取背景知识
+                                bg_knowledge = get_enhanced_background_knowledge()
+
+                                df_new = generate_gap_cases(req_content, missing, model, API_KEY, base_url, row['需求ID'], bg_knowledge)
+                                if not df_new.empty:
+                                    # 添加需求编号
+                                    if "需求编号" not in df_new.columns:
+                                        df_new.insert(0, "需求编号", row['需求ID'] or "AUTO-GEN")
+                                    new_cases.append(df_new)
+
+                                progress_bar.progress((i + 1) / len(targets))
+
+                            if new_cases:
+                                all_new_df = pd.concat(new_cases, ignore_index=True)
+                                st.session_state.gap_cases_df = all_new_df # 保存到 session_state
+                                st.success(f"已生成 {len(all_new_df)} 条补充用例")
+                            else:
+                                st.warning("未能生成有效用例")
+
+                # 显示已生成的补充用例（如果存在）
+                if st.session_state.get('gap_cases_df') is not None:
+                    st.dataframe(st.session_state.gap_cases_df)
+                    make_excel_download(st.session_state.gap_cases_df, "补充测试用例.xlsx")
+
+            with col_act2:
+                st.markdown("##### ⚖️ 现有用例质量检查")
+                st.caption("使用 AI 审查现有用例的逻辑合理性和完整性。")
+
+                total_existing = len(st.session_state.existing_cases_df)
+                review_count = st.number_input("审查数量", min_value=1, max_value=total_existing, value=min(5, total_existing), step=1, help="选择要审查的用例数量，建议先少量尝试")
+
+                if st.button("审查现有用例"):
+                    # 选取部分用例进行演示（避免消耗过多 Token）
+                    cases_to_review = st.session_state.existing_cases_df.head(review_count)
+                    st.info(f"正在审查前 {len(cases_to_review)} 条用例...")
+
+                    from coverage_analyzer import evaluate_case_quality_with_llm
+                    import concurrent.futures
+
+                    reviews = [None] * len(cases_to_review)
+                    review_progress = st.progress(0)
+
+                    # 准备需求映射表 (ID -> 内容)
+                    req_map = {}
+                    batch_reqs = st.session_state.get('batch_requirements', [])
+                    for req in batch_reqs:
+                        # 尝试提取ID
+                        rid = extract_req_id(req)
+                        if rid:
+                            req_map[rid] = req
+                        # 同时也用前20个字符作为key，以防万一
+                        req_map[req[:20]] = req
+
+                    # 准备现有用例集摘要 (用于上下文)
+                    # 为了避免Token超限，只提取 ID 和 标题/描述
+                    context_cases_list = []
+                    for _, row in st.session_state.existing_cases_df.iterrows():
+                        cid = str(row.get('测试名称', '') or row.get('用例编号', '')).strip()
+                        cdesc = str(row.get('测试描述', '') or row.get('需求描述', '')).strip()[:50]
+                        if cid or cdesc:
+                            context_cases_list.append(f"- {cid}: {cdesc}")
+
+                    # 限制上下文长度 (例如最多 5000 字符)
+                    context_cases_str = "\n".join(context_cases_list)
+                    if len(context_cases_str) > 5000:
+                        context_cases_str = context_cases_str[:5000] + "\n... (部分用例已省略)"
+
+                    # 使用 ThreadPoolExecutor 并发执行
+                    # 限制并发数为 5，避免触发速率限制
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        future_to_idx = {}
+                        for i, (idx, case) in enumerate(cases_to_review.iterrows()):
+                            # 优先从用例中获取需求ID
+                            case_req_id = str(case.get('需求编号', '')).strip()
+                            req_desc = ""
+
+                            # 1. 尝试通过ID查找完整需求
+                            if case_req_id and case_req_id in req_map:
+                                req_desc = req_map[case_req_id]
+                            # 2. 尝试通过需求描述查找
+                            elif str(case.get('需求描述', ''))[:20] in req_map:
+                                req_desc = req_map[str(case.get('需求描述', ''))[:20]]
+                            # 3. 回退到用例自带的描述
+                            else:
+                                req_desc = str(case.get('需求描述', '')) or str(case.get('需求内容', '')) or "未知需求"
+
+                            # 增加超时时间到 120 秒，并传入 context_cases
+                            future = executor.submit(evaluate_case_quality_with_llm, req_desc, case.to_dict(), model, API_KEY, base_url, timeout=120, context_cases=context_cases_str)
+                            future_to_idx[future] = i
+
+                        completed_count = 0
+                        for future in concurrent.futures.as_completed(future_to_idx):
+                            i = future_to_idx[future]
+                            try:
+                                res = future.result()
+                                case = cases_to_review.iloc[i]
+                                reviews[i] = {
+                                    "用例ID": case.get('测试名称', '') or case.get('用例编号', ''),
+                                    "质量得分": res.get('score'),
+                                    "问题": res.get('issue'),
+                                    "改进建议": res.get('suggestion')
+                                }
+                            except Exception as e:
+                                reviews[i] = {
+                                    "用例ID": "Unknown",
+                                    "质量得分": 0,
+                                    "问题": f"审查失败: {str(e)}",
+                                    "改进建议": ""
+                                }
+
+                            completed_count += 1
+                            review_progress.progress(completed_count / len(cases_to_review))
+
+                    review_df = pd.DataFrame(reviews)
+                    st.session_state.review_results_df = review_df # 保存到 session_state
+                    st.success(f"已完成 {len(review_df)} 条用例的审查")
+
+                # 显示审查结果（如果存在）
+                if st.session_state.get('review_results_df') is not None:
+                    st.dataframe(st.session_state.review_results_df)
+
+    with tab_script_check:
+        st.subheader("脚本一致性校验")
+        st.markdown("上传包含脚本步骤和人工步骤的测试用例文件，AI 将自动检查其一致性。")
+
+        # Input source selection
+        input_source = st.radio("选择输入方式", ["上传文件 (Excel/CSV)", "飞书表格链接"], horizontal=True, key="script_check_source")
+
+        df = None
+
+        if input_source == "上传文件 (Excel/CSV)":
+            st.markdown("支持格式: Excel (.xlsx), CSV (.csv)")
+            uploaded_script_file = st.file_uploader("上传测试用例文件", type=["xlsx", "csv"], key="script_check_uploader")
+
+            if uploaded_script_file:
+                try:
+                    if uploaded_script_file.name.endswith('.xlsx'):
+                        dfs = read_excel(uploaded_script_file)
+                        sheet_names = list(dfs.keys())
+                        selected_sheet = st.selectbox("选择工作表", sheet_names, key="script_check_sheet")
+                        df = dfs[selected_sheet]
+                    else:
+                        # CSV
+                        try:
+                            df = pd.read_csv(uploaded_script_file)
+                        except UnicodeDecodeError:
+                            uploaded_script_file.seek(0)
+                            df = pd.read_csv(uploaded_script_file, encoding='gbk')
+                except Exception as e:
+                    st.error(f"文件处理失败: {e}")
+        else:
+            # Feishu Sheet Input
+            st.markdown("输入飞书表格链接，自动读取内容。")
+            feishu_url = st.text_input("飞书表格链接", placeholder="https://mi.feishu.cn/sheets/...", key="script_check_feishu_url")
+
+            col_load, col_clear = st.columns([1, 5])
+            with col_load:
+                load_btn = st.button("读取表格", key="read_feishu_script_check")
+
+            if load_btn:
+                if not feishu_url:
+                    st.warning("请输入链接")
+                else:
+                    with st.spinner("正在读取飞书表格..."):
+                        content = fetch_feishu_document(feishu_url)
+                        if content and not content.startswith("【"):
+                             loaded_df = parse_markdown_table_to_df(content)
+                             if loaded_df.empty:
+                                 st.warning("未能从文档中解析出表格数据")
+                             else:
+                                 st.session_state['script_check_feishu_df'] = loaded_df
+                                 st.success(f"成功读取 {len(loaded_df)} 行数据")
+                        else:
+                            st.error(f"读取失败: {content}")
+
+            # Retrieve from session state
+            if 'script_check_feishu_df' in st.session_state:
+                df = st.session_state['script_check_feishu_df']
+                with col_clear:
+                    if st.button("清除数据", key="clear_feishu_df"):
+                        del st.session_state['script_check_feishu_df']
+                        df = None
+                        st.rerun()
+
+        if df is not None:
+            st.dataframe(df.head())
+
+            # 灵活的列名匹配逻辑
+            col_map = {}
+            # 定义标准字段名与可能的变体
+            field_definitions = {
+                "需求描述": ["需求描述", "需求内容", "Requirement Description", "Req Desc"],
+                "测试描述": ["测试描述", "测试标题", "用例标题", "Test Description", "Case Title"],
+                "脚本测试步骤": ["脚本测试步骤", "脚本步骤", "Script Steps", "Script Procedure"],
+                "脚本测试结果": ["脚本测试结果", "脚本结果", "Script Result", "Script Outcome"],
+                "测试步骤": ["测试步骤", "人工测试步骤", "Test Steps", "Steps"],
+                "预期结果": ["预期结果", "人工预期结果", "Expected Result", "Expected"]
+            }
+
+            # 自动查找匹配的列
+            for field, keywords in field_definitions.items():
+                found_col = None
+                # 1. 尝试精确匹配
+                if field in df.columns:
+                    found_col = field
+                else:
+                    # 2. 尝试关键词包含匹配
+                    for col in df.columns:
+                        for kw in keywords:
+                            if kw in col:
+                                found_col = col
+                                break
+                        if found_col: break
+
+                if found_col:
+                    col_map[field] = found_col
+
+            # 检查缺失列
+            missing_cols = [f for f in field_definitions.keys() if f not in col_map]
+
+            if missing_cols:
+                st.warning(f"未找到以下必要列 (或其近似列): {', '.join(missing_cols)}")
+                st.info(f"当前识别到的列映射: {col_map}")
+                st.markdown("**请确保表格包含上述信息，或修改列名以包含关键词。**")
+            else:
+                st.success(f"已自动映射所有列: {col_map}")
+
+                if st.button("开始校验", key="start_script_check"):
+                    results = []
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    total_rows = len(df)
+                    for index, row in df.iterrows():
+                        status_text.text(f"正在校验第 {index + 1}/{total_rows} 条...")
+
+                        # 构造标准化的 row 数据供检查函数使用
+                        check_row = {}
+                        for std_field, actual_col in col_map.items():
+                            check_row[std_field] = row[actual_col]
+
+                        # Pass call_model function
+                        res = check_script_consistency(check_row, call_model, model, base_url, temperature)
+
+                        # Add result to list
+                        result_row = row.to_dict()
+                        result_row["校验结果"] = "通过" if res.get("is_consistent") else "不通过"
+                        result_row["一致性得分"] = res.get("score", 0)
+                        result_row["发现问题"] = res.get("issues", "")
+                        result_row["改进建议"] = res.get("suggestions", "")
+                        results.append(result_row)
+
+                        progress_bar.progress((index + 1) / total_rows)
+
+                    status_text.text("校验完成！")
+                    result_df = pd.DataFrame(results)
+
+                    # Display summary
+                    pass_count = len(result_df[result_df["校验结果"] == "通过"])
+                    st.success(f"校验完成: {pass_count}/{total_rows} 通过")
+
+                    st.dataframe(result_df)
+                    make_excel_download(result_df, "脚本校验结果.xlsx")
+
+    with tab4:
+        st.subheader("思维导图生成")
+        st.markdown("输入飞书表格链接，自动提取需求编号和测试描述，生成思维导图。")
+
+        mm_url = st.text_input("飞书表格链接", placeholder="https://mi.feishu.cn/sheets/...", key="mindmap_url")
+
+        # Option to group by owner
+        group_by_owner = st.checkbox("按需求owner分组 (Group by Owner)", value=False, help="如果表格中有需求owner列，将按需求owner对需求进行分组")
+
+        if st.button("生成思维导图"):
+            if not mm_url:
+                st.warning("请输入飞书表格链接")
+            else:
+                with st.spinner("正在读取飞书表格..."):
+                    # Fetch content
+                    content = fetch_feishu_document(mm_url)
+
+                    if content and not content.startswith("【"):
+                        # Extract Sheet Title from the first line if available
+                        sheet_title = "测试用例思维导图"
+                        lines = content.split('\n')
+                        if lines and lines[0].startswith("# Sheet:"):
+                            sheet_title = lines[0].replace("# Sheet:", "").strip()
+
+                        # Parse Markdown Table
+                        df = parse_markdown_table_to_df(content)
+
+                        if not df.empty:
+                            st.success(f"成功读取 {len(df)} 行数据")
+
+                            # Check columns
+                            req_col = None
+                            desc_col = None
+                            step_col = None
+                            expect_col = None
+                            pre_col = None
+                            req_desc_col = None
+                            owner_col = None
+
+                            # Flexible column matching
+                            for col in df.columns:
+                                if "需求编号" in col: req_col = col
+                                if "测试描述" in col: desc_col = col
+                                if "测试步骤" in col: step_col = col
+                                if "预期结果" in col: expect_col = col
+                                if "前置条件" in col: pre_col = col
+                                if "需求描述" in col: req_desc_col = col
+                                if any(k in col for k in ["需求owner", "责任人", "Owner", "提出人", "负责人"]): owner_col = col
+
+                            # Helper for consistent colors
+                            def get_color_for_string(s):
+                                import hashlib
+                                colors = [
+                                    "#FF5733", "#33FF57", "#3357FF", "#FF33F6", "#33FFF6",
+                                    "#F6FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF3333",
+                                    "#3380FF", "#FF3380", "#80FF33", "#33FFCC", "#CC33FF"
+                                ]
+                                if not s: return "#000000"
+                                hash_val = int(hashlib.md5(str(s).encode('utf-8')).hexdigest(), 16)
+                                return colors[hash_val % len(colors)]
+
+                            # Helper to sanitize text for Markdown/Markmap
+                            def sanitize_for_mm(text):
+                                if not text: return ""
+                                # Replace newlines with spaces to prevent breaking Markdown structure
+                                s = str(text).strip().replace('\n', ' ').replace('\r', '')
+                                # Escape HTML characters to prevent breaking the structure or the span tags
+                                s = s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+                                return s
+
+                            if req_col and desc_col:
+                                # Generate Mind Map Markdown
+                                clean_title = sanitize_for_mm(sheet_title)
+                                mm_md = f"# {clean_title}\n"
+
+                                # Determine grouping strategy
+                                if group_by_owner and owner_col:
+                                    # Group by Owner then Requirement ID
+                                    # Fill NaN owners with "Unknown"
+                                    df[owner_col] = df[owner_col].fillna("未指定")
+                                    grouped_owner = df.groupby(owner_col)
+
+                                    for owner, owner_group in grouped_owner:
+                                        if not owner or str(owner).strip() == "": owner = "未指定"
+                                        clean_owner = sanitize_for_mm(owner)
+                                        color = get_color_for_string(clean_owner)
+                                        mm_md += f"## <span style='color:{color}'>{clean_owner}</span>\n"
+
+                                        grouped_req = owner_group.groupby(req_col)
+                                        for req_id, group in grouped_req:
+                                            if not req_id or str(req_id).strip() == "": continue
+
+                                            clean_req_id = sanitize_for_mm(req_id)
+
+                                            # Add Requirement Description
+                                            req_desc_str = ""
+                                            if req_desc_col:
+                                                first_desc = group[req_desc_col].iloc[0]
+                                                if first_desc and str(first_desc).strip():
+                                                    clean_desc = sanitize_for_mm(first_desc)
+                                                    if len(clean_desc) > 30:
+                                                        clean_desc = clean_desc[:30] + "..."
+                                                    req_desc_str = f" ({clean_desc})"
+
+                                            mm_md += f"### {clean_req_id}{req_desc_str}\n"
+
+                                            for idx, row in group.iterrows():
+                                                desc = row[desc_col]
+                                                if desc and str(desc).strip() != "":
+                                                    clean_test_desc = sanitize_for_mm(desc)
+                                                    mm_md += f"- **{clean_test_desc}**\n"
+                                                    # Add details
+                                                    details = []
+                                                    if pre_col and row[pre_col] and str(row[pre_col]).strip():
+                                                        details.append(f"前置: {sanitize_for_mm(row[pre_col])}")
+                                                    if step_col and row[step_col] and str(row[step_col]).strip():
+                                                        details.append(f"步骤: {sanitize_for_mm(row[step_col])}")
+                                                    if expect_col and row[expect_col] and str(row[expect_col]).strip():
+                                                        details.append(f"预期: {sanitize_for_mm(row[expect_col])}")
+                                                    for det in details:
+                                                        mm_md += f"    - {det}\n"
+
+                                else:
+                                    # Default grouping by Requirement ID (with colored owner tag)
+                                    grouped = df.groupby(req_col)
+
+                                    for req_id, group in grouped:
+                                        if not req_id or str(req_id).strip() == "": continue
+
+                                        clean_req_id = sanitize_for_mm(req_id)
+
+                                        # Add Requirement Description if available (take the first one found for this ID)
+                                        req_desc_str = ""
+                                        if req_desc_col:
+                                            first_desc = group[req_desc_col].iloc[0]
+                                            if first_desc and str(first_desc).strip():
+                                                # Truncate if too long for a node title
+                                                clean_desc = sanitize_for_mm(first_desc)
+                                                if len(clean_desc) > 30:
+                                                    clean_desc = clean_desc[:30] + "..."
+                                                req_desc_str = f" ({clean_desc})"
+
+                                        # Handle Owner
+                                        req_display = f"{clean_req_id}{req_desc_str}"
+
+                                        if owner_col:
+                                            owner_val = group[owner_col].iloc[0]
+                                            if owner_val and str(owner_val).strip():
+                                                owner_name = sanitize_for_mm(owner_val)
+                                                color = get_color_for_string(owner_name)
+                                                # Use HTML span for color (supported by Markmap and some MD viewers)
+                                                # Also append owner name
+                                                req_display = f'<span style="color:{color}">{clean_req_id} [{owner_name}]</span>{req_desc_str}'
+
+                                        mm_md += f"## {req_display}\n"
+
+                                        for idx, row in group.iterrows():
+                                            desc = row[desc_col]
+                                            if desc and str(desc).strip() != "":
+                                                clean_test_desc = sanitize_for_mm(desc)
+                                                mm_md += f"- **{clean_test_desc}**\n"
+
+                                                # Add details as sub-nodes
+                                                details = []
+                                                if pre_col and row[pre_col] and str(row[pre_col]).strip():
+                                                    details.append(f"前置: {sanitize_for_mm(row[pre_col])}")
+                                                if step_col and row[step_col] and str(row[step_col]).strip():
+                                                    details.append(f"步骤: {sanitize_for_mm(row[step_col])}")
+                                                if expect_col and row[expect_col] and str(row[expect_col]).strip():
+                                                    details.append(f"预期: {sanitize_for_mm(row[expect_col])}")
+
+                                                for det in details:
+                                                    mm_md += f"    - {det}\n"
+
+                                st.markdown("### 生成结果")
+                                st.text_area("Markdown 思维导图 (可复制到 XMind/Markmap)", mm_md, height=400)
+
+                                # Try to render using markmap if possible, or just simple markdown
+                                st.markdown("### 预览")
+                                st.markdown(mm_md)
+
+                            else:
+                                st.error(f"未找到必要的列: 需求编号, 测试描述. 找到的列: {list(df.columns)}")
+                                st.dataframe(df.head())
+                        else:
+                            st.warning("未能解析出表格数据")
+                    else:
+                        st.error(f"读取失败: {content}")
+
+
+    with tab5:
         st.subheader("示例与最佳实践")
         for ex in get_requirement_examples(): st.write(f"- {ex}")
         st.markdown("---")
@@ -2855,10 +3481,10 @@ def main():
         - 📝 **直接粘贴**: 复制文档内容直接粘贴到文本框
         - 🌐 **网页链接**: 输入文档URL，自动抓取内容
         - 🪶 **飞书文档**: 通过API访问或导出后上传
-        
+
         **飞书文档访问问题解决：**
         - **权限不足**: 使用 tenant_access_token 只能访问公开文档
-        - **替代方案**: 
+        - **替代方案**:
           1. 在飞书中导出为 Word/PDF → 上传文件
           2. 复制文档内容 → 直接粘贴到文本框
           3. 设置文档为公开分享 → 使用网页链接输入
@@ -2886,29 +3512,29 @@ def _process_user_commands(command: str):
     """处理用户命令"""
     if not command.strip():
         return
-    
+
     original_reqs = st.session_state.batch_requirements.copy()
-    
+
     # 删除命令
     if command.startswith("删除"):
         keyword = command.replace("删除", "").strip()
         if keyword:
             st.session_state.batch_requirements = [
-                req for req in original_reqs 
+                req for req in original_reqs
                 if keyword.lower() not in req.lower()
             ]
             st.success(f"已删除包含 '{keyword}' 的需求，剩余 {len(st.session_state.batch_requirements)} 条")
-    
+
     # 保留命令
     elif command.startswith("保留"):
         keyword = command.replace("保留", "").strip()
         if keyword:
             st.session_state.batch_requirements = [
-                req for req in original_reqs 
+                req for req in original_reqs
                 if keyword.lower() in req.lower()
             ]
             st.success(f"已保留包含 '{keyword}' 的需求，剩余 {len(st.session_state.batch_requirements)} 条")
-    
+
     # 添加前缀
     elif command.startswith("添加前缀"):
         prefix = command.replace("添加前缀", "").strip()
@@ -2917,7 +3543,7 @@ def _process_user_commands(command: str):
                 f"{prefix} {req}" for req in original_reqs
             ]
             st.success(f"已为所有需求添加前缀 '{prefix}'")
-    
+
     # 合并相似需求（简单实现）
     elif command == "合并相似":
         # 简单的相似度合并（基于关键词）
@@ -2933,11 +3559,11 @@ def _process_user_commands(command: str):
                     break
             if not is_similar:
                 merged.append(req)
-        
+
         if len(merged) < len(original_reqs):
             st.session_state.batch_requirements = merged
             st.success(f"已合并相似需求，从 {len(original_reqs)} 条减少到 {len(merged)} 条")
-    
+
     # 清理重复
     elif command == "清理重复":
         unique_reqs = []
@@ -2946,11 +3572,11 @@ def _process_user_commands(command: str):
             if req not in seen:
                 seen.add(req)
                 unique_reqs.append(req)
-        
+
         if len(unique_reqs) < len(original_reqs):
             st.session_state.batch_requirements = unique_reqs
             st.success(f"已清理重复需求，从 {len(original_reqs)} 条减少到 {len(unique_reqs)} 条")
-    
+
     else:
         st.warning("未知命令，请使用：删除/保留/添加前缀/合并相似/清理重复")
 

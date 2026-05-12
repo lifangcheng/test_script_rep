@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(.venv313/Scripts/python.exe *)",
+      "Bash(cat)",
+      "Bash(bash /tmp/run_batch.sh)",
+      "Bash(bash /tmp/run_batch2.sh)",
+      "Bash(./.venv/Scripts/python -c \"import langgraph,sys;print\\('langgraph ok',sys.executable\\)\")",
+      "Bash(./.venv/Scripts/python *)",
+      "Bash(tee /d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-1/eval-0-single/with_skill/outputs/eval_single/run.log)",
+      "Bash(/d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/.venv/Scripts/python *)",
+      "Bash(tee \"D:/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-1/eval-2-rule-update/with_skill/outputs/run.log\")",
+      "Bash(tee \"/d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-1/eval-2-rule-update/without_skill/outputs/run.log\")",
+      "Bash(tee \"D:/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-1/eval-2-rule-update/without_skill/outputs/run.log\")",
+      "Bash(py *)",
+      "Bash(cp -r can-agent-workspace/iteration-1/eval-0-single can-agent-workspace/iteration-2/)",
+      "Bash(cp -r can-agent-workspace/iteration-1/eval-1-batch can-agent-workspace/iteration-2/)",
+      "Bash(cp -r can-agent-workspace/iteration-1/eval-2-rule-update can-agent-workspace/iteration-2/)",
+      "Bash(tee \"/d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-0-single/with_skill/outputs/run.log\")",
+      "Bash(mkdir -p /d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-0-single/without_skill/outputs/eval_single)",
+      "Bash(python /d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/cli.py --blf '/d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/MT516 26A V2L 微波炉-20260126170402_CAN.blf' --dbc '/d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/MS12&MS13_EDCU_PTCANFD_251301.dbc' --out /d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-0-single/without_skill/outputs/eval_single)",
+      "Bash(echo \"exit_code=$?\")",
+      "Bash(mkdir -p /d/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-1-batch/with_skill/outputs/batch)",
+      "Bash(:)",
+      "Bash(set -euo pipefail)",
+      "Bash(tee \"D:/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-2-rule-update/with_skill/outputs/run.log\")",
+      "Bash(tee \"D:/project/TestCase_auto_gen/tool/AI_analysis/can-agent/can-agent-workspace/iteration-2/eval-2-rule-update/without_skill/outputs/run.log\")",
+      "mcp__feishu-mcp-pro__doc_create",
+      "mcp__feishu-mcp-pro__doc_append",
+      "mcp__feishu-mcp-pro__doc_read",
+      "mcp__feishu-mcp-pro__doc_write",
+      "Bash(dir *.blf)"
+    ]
+  }
+}

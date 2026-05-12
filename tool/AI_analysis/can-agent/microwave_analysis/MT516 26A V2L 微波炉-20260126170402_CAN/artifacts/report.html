@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>CAN Analysis Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .card { border: 1px solid #eee; padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 12px; }
+    th { background: #fafafa; text-align: left; }
+  </style>
+</head>
+<body>
+  <h2>CAN Analysis Report</h2>
+  <div class="card">
+    <div><b>Generated:</b> 1970-01-01T00:00:00Z</div>
+    <div><b>Rows:</b> 4897</div>
+    <div><b>Signals:</b> 3</div>
+    <div><b>Frames:</b> 3</div>
+    <div><b>Anomalies:</b> 4</div>
+  </div>
+
+  <div class="card">
+    <h3>Diagnosis Summary</h3>
+    <pre>{
+  "summary": {
+    "total_anomalies": 4,
+    "by_kind": {
+      "rule_trigger": 4
+    },
+    "by_severity": {
+      "high": 4
+    },
+    "top_signals": [
+      {
+        "signal": "OBCFltLvlIndcn",
+        "count": 4
+      }
+    ]
+  },
+  "notes": [
+    "This diagnosis is rule-based. Validate against vehicle context and DBC definitions."
+  ]
+}</pre>
+  </div>
+
+  <div class="card">
+    <h3>Anomalies</h3>
+    <table>
+      <thead>
+        <tr><th>kind</th><th>severity</th><th>signal</th><th>can_id(hex)</th><th>start</th><th>end</th><th>count</th><th>rule</th><th>start(UTC)</th><th>end(UTC)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>rule_trigger</td><td>high</td><td>OBCFltLvlIndcn</td><td>0x140</td><td>1769418274.9842348</td><td>1769418281.244387</td><td>314</td><td>OBC故障等级非0</td><td>2026-01-26T09:04:34.984235Z</td><td>2026-01-26T09:04:41.244387Z</td></tr><tr><td>rule_trigger</td><td>high</td><td>OBCFltLvlIndcn</td><td>0x140</td><td>1769418274.9842348</td><td>1769418281.244387</td><td>314</td><td>OBC故障等级非0(Eval2新增)</td><td>2026-01-26T09:04:34.984235Z</td><td>2026-01-26T09:04:41.244387Z</td></tr><tr><td>rule_trigger</td><td>high</td><td>OBCFltLvlIndcn</td><td>0x140</td><td>1769418274.9842348</td><td>1769418281.244387</td><td>314</td><td>OBC故障等级非0(严格)</td><td>2026-01-26T09:04:34.984235Z</td><td>2026-01-26T09:04:41.244387Z</td></tr><tr><td>rule_trigger</td><td>high</td><td>OBCFltLvlIndcn</td><td>0x140</td><td>1769418274.9842348</td><td>1769418281.244387</td><td>314</td><td>OBC故障等级非0(值字段)</td><td>2026-01-26T09:04:34.984235Z</td><td>2026-01-26T09:04:41.244387Z</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>AI Analysis (per anomaly)</h3>
+    <table>
+      <thead>
+        <tr><th>signal</th><th>anomaly</th><th>analysis</th></tr>
+      </thead>
+      <tbody>
+        <tr><td colspan="3">No AI analysis</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Graph</h3>
+    <p>Open <code>graph.html</code> for interactive charts.</p>
+  </div>
+</body>
+</html>

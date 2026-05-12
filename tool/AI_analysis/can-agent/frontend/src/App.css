@@ -1,0 +1,69 @@
+:root {
+  --bg: #f7f9fb;
+  --card: #ffffff;
+  --text: #1f2933;
+  --text-secondary: #6b7a90;
+  --primary: #1677ff; /* Ant 默认蓝 */
+  --border: #e5e7eb;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.ant-layout {
+  background: var(--bg);
+}
+
+.ant-layout-sider {
+  background: #0f172a;
+}
+
+.ant-layout-header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.page-shell {
+  display: grid;
+  gap: 16px;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 12px;
+  box-shadow: 0 6px 24px rgba(15, 23, 42, 0.06);
+}
+
+.section-title {
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.section-subtitle {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+}
+
+.form-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.result-grid {
+  display: grid;
+  gap: 12px;
+}
+
+@media (max-width: 992px) {
+  .page-shell {
+    grid-template-columns: 1fr;
+  }
+}

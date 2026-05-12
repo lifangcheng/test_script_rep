@@ -14,6 +14,7 @@ import requests
 from urllib.parse import urlparse
 import time
 import json
+import openpyxl
 import os
 
 # Constants
@@ -45,7 +46,7 @@ def fetch_url_content(url: str, timeout: int = 10, max_chars: int = MAX_CHARS) -
                         print(f"[DEBUG] Feishu API failed, fallback to web: {e}")
                     st.warning(f"飞书API访问失败: {str(e)}，尝试网页抓取方式")
 
-        # Regular webpage handling 
+        # Regular webpage handling
         r = requests.get(url, timeout=min(timeout, 15), headers={"User-Agent": "TestCaseGenBot/1.0"})
         if r.status_code != 200:
             return f"【失败 {r.status_code}】{url}"
@@ -115,63 +116,146 @@ def read_background_doc(file: Optional[BytesIO]) -> Optional[str]:
         except Exception as e:
             st.error(f"PDF读取失败: {e}")
             return None
-    st.warning("不支持的文件类型，请使用 .docx, .txt, .md 或 .pdf")
+    if name.endswith(('.xlsx', '.xls')):
+        try:
+            return read_excel_file(file, sheet_name=None)  # None 表示读取所有sheet
+        except Exception as e:
+            st.error(f"Excel读取失败: {e}")
+            return None
+    st.warning("不支持的文件类型，请使用 .docx, .txt, .md, .pdf, .xlsx 或 .xls")
     return None
 
-def fetch_feishu_document(url_or_id: str, debug: bool = False) -> str:
-    """Get Feishu document content via API and convert to markdown.
+def fetch_feishu_document(url_or_id: str, debug: bool = False, user_access_token: Optional[str] = None) -> str:
+    """Fetch Feishu docx/wiki/sheets content and return Markdown.
+
+    IMPORTANT:
+    - Do NOT spawn subprocesses from within the Streamlit app.
+      In both dev and packaged mode this can create another Streamlit instance
+      and a different port.
+
+    For sheets links, this returns a Markdown table.
 
     Args:
-        url_or_id: Document URL or ID
-        debug: Enable debug mode for more verbose output
-
-    Returns:
-        Document content as markdown string
+        url_or_id: 飞书文档/表格链接或 ID
+        debug: 调试开关
+        user_access_token: 可选的用户态 token；提供时优先使用该 token 访问。
     """
-    # 优先尝试使用独立的 feishu_fetcher.py 脚本，因为它经过验证更稳定
+
+    url_or_id = (url_or_id or "").strip()
+    if not url_or_id:
+        return "【飞书API错误】输入为空"
+
     try:
-        import subprocess
-        import sys
+        from feishu_client import FeishuClient
 
-        fetcher_path = os.path.join(os.path.dirname(__file__), "feishu_fetcher.py")
-        if os.path.exists(fetcher_path):
-            if debug:
-                print(f"[DEBUG] Invoking subprocess: {fetcher_path} {url_or_id}")
+        app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+        app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+        if not app_id or not app_secret:
+            return "【飞书API错误】缺少 FEISHU_APP_ID / FEISHU_APP_SECRET 环境变量"
 
-            # 确保环境变量传递给子进程，并强制使用 UTF-8
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
+        client = FeishuClient(
+            app_id=app_id,
+            app_secret=app_secret,
+            debug=debug,
+            user_access_token=user_access_token or os.environ.get("FEISHU_USER_ACCESS_TOKEN") or None,
+        )
 
-            command = [sys.executable, fetcher_path, url_or_id]
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                env=env
-            )
-            stdout, stderr = process.communicate(timeout=300)
+        if "/sheets/" in url_or_id:
+            return client.fetch_sheet_as_markdown(url_or_id)
 
-            if debug and stderr:
-                print(f"[DEBUG] Subprocess stderr: {stderr}")
-
-            if process.returncode == 0:
-                content = stdout.strip()
-                if content:
-                    return content
-                else:
-                    return "【飞书API错误】获取到的文档内容为空"
-            else:
-                error_msg = stderr.strip() if stderr else "未知错误"
-                return f"【飞书API错误】子进程执行失败 (Code {process.returncode}): {error_msg}"
+        return client.fetch_document(url_or_id)
 
     except Exception as e:
-        return f"【飞书API错误】子进程调用异常: {str(e)}"
+        if debug:
+            print(f"[DEBUG] Feishu fetch failed: {e}")
+        return f"【飞书API错误】{e}"
 
-    # 如果代码执行到这里，说明 fetcher_path 不存在
-    return "【飞书API错误】找不到 feishu_fetcher.py 脚本"
+def read_excel_file(file, sheet_name: Optional[str] = None) -> str:
+    """读取Excel文件并转换为Markdown格式的表格
+
+    Args:
+        file: 上传的文件对象
+        sheet_name: 指定的sheet名称，None表示读取所有sheet
+
+    Returns:
+        Markdown格式的表格内容
+    """
+    try:
+        # 读取Excel文件
+        excel_data = pd.ExcelFile(file)
+
+        # 获取所有sheet名称
+        sheet_names = excel_data.sheet_names
+
+        if not sheet_names:
+            return "Excel文件中没有找到任何sheet"
+
+        markdown_content = []
+
+        # 如果指定了sheet_name，只读取该sheet
+        if sheet_name:
+            if sheet_name not in sheet_names:
+                return f"未找到名为 '{sheet_name}' 的sheet，可用的sheet有: {', '.join(sheet_names)}"
+
+            df = pd.read_excel(file, sheet_name=sheet_name)
+            markdown_content.append(f"## Sheet: {sheet_name}\n")
+            markdown_content.append(dataframe_to_markdown(df))
+        else:
+            # 读取所有sheet
+            for sheet in sheet_names:
+                df = pd.read_excel(file, sheet_name=sheet)
+                markdown_content.append(f"## Sheet: {sheet}\n")
+                markdown_content.append(dataframe_to_markdown(df))
+                markdown_content.append("\n")
+
+        return "\n".join(markdown_content)
+
+    except Exception as e:
+        return f"Excel文件读取失败: {str(e)}"
+
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    """将DataFrame转换为Markdown表格格式"""
+    if df.empty:
+        return "表格为空"
+
+    # 处理NaN值
+    df = df.fillna('')
+
+    # 获取列名
+    columns = df.columns.tolist()
+
+    # 构建表头
+    header = "| " + " | ".join(str(col) for col in columns) + " |"
+    separator = "| " + " | ".join(["---"] * len(columns)) + " |"
+
+    # 构建数据行
+    rows = []
+    for _, row in df.iterrows():
+        # 处理单元格中的换行符，替换为空格或HTML换行
+        processed_cells = []
+        for cell in row:
+            cell_str = str(cell)
+            # 将换行符替换为空格，避免破坏表格结构
+            cell_str = cell_str.replace('\n', ' ').replace('\r', ' ')
+            # 去除多余的空格
+            cell_str = ' '.join(cell_str.split())
+            processed_cells.append(cell_str)
+
+        row_data = "| " + " | ".join(processed_cells) + " |"
+        rows.append(row_data)
+
+    return "\n".join([header, separator] + rows)
+
+
+def get_excel_sheet_names(file) -> List[str]:
+    """获取Excel文件中的所有sheet名称"""
+    try:
+        excel_data = pd.ExcelFile(file)
+        return excel_data.sheet_names
+    except Exception as e:
+        return []
+
 
 def process_requirements_from_text(text: str, min_length: int = 5) -> List[str]:
     """Extract requirements from text content."""
@@ -292,7 +376,7 @@ def process_uploaded_files(files: List[BytesIO], min_length: int = MIN_PARAGRAPH
 def render_batch_input() -> None:
     """Render batch input interface."""
     st.markdown("### 需求输入方式")
-    
+
     # 1. Feishu document
     st.subheader("方式1: 飞书文档")
     feishu_doc = st.text_input("输入飞书文档链接或ID")
@@ -312,10 +396,10 @@ def render_batch_input() -> None:
                     st.error(content)
         except Exception as e:
             st.error(f"读取失败: {e}")
-    
+
     # 2. File upload
     st.subheader("方式2: 文件上传")
-    files = st.file_uploader("支持 Excel, Word, PDF, TXT", 
+    files = st.file_uploader("支持 Excel, Word, PDF, TXT",
                             type=['xlsx', 'docx', 'pdf', 'txt'],
                             accept_multiple_files=True)
     if files:
@@ -324,7 +408,7 @@ def render_batch_input() -> None:
             st.session_state[f'file_reqs_{source}'] = reqs
             st.success(f"从 {source} 读取了 {len(reqs)} 条需求")
             st.session_state['source_counts'].append(f"{source}:{len(reqs)}")
-    
+
     # 3. Manual input
     st.subheader("方式3: 手动输入")
     manual_text = st.text_area("每行一条需求", height=150)

@@ -65,44 +65,54 @@ def handle_api_errors(func):
             raise APIError(f"API调用异常: {e}")
     return wrapper
 
+def _escape_md_cell(v: object) -> str:
+    s = "" if v is None else str(v)
+    # Keep tables stable
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = s.replace("|", "\\|")
+    return s
+
+
 class FeishuClient:
     """飞书API客户端
-    
+
     提供飞书API的统一访问接口，支持:
     - 认证和令牌管理
     - 文档访问和解析
     - 文档块处理和转换
     """
-    
+
     def __init__(
-        self, 
-        app_id: str, 
-        app_secret: str, 
-        debug: bool = False
+        self,
+        app_id: str,
+        app_secret: str,
+        debug: bool = False,
+        user_access_token: Optional[str] = None,
     ):
         """初始化飞书客户端
-        
+
         Args:
             app_id: 飞书应用ID
             app_secret: 飞书应用密钥
             debug: 是否启用调试模式
+            user_access_token: 可选的用户态 token；提供时会优先用于需要权限的读取。
         """
         self.app_id = app_id
         self.app_secret = app_secret
         self.debug = debug
+        self.user_access_token = user_access_token
         self._token_cache: Optional[str] = None
         self._token_expire: Optional[float] = None
-    
     @handle_api_errors
     def get_user_access_token(self, code: str) -> str:
         """通过授权码获取飞书用户访问令牌
-        
+
         Args:
             code: 用户授权码
-            
+
         Returns:
             用户访问令牌
-            
+
         Raises:
             AuthenticationError: 获取令牌失败
             NetworkError: 网络请求失败
@@ -114,56 +124,56 @@ class FeishuClient:
             "client_secret": self.app_secret,
             "code": code
         }
-        
+
         if self.debug:
             logger.debug(f"Requesting user token with code: {code[:10]}...")
-            
+
         resp = requests.post(
             FeishuConfig.OAUTH_TOKEN_URL,
             json=payload,
             timeout=10
         )
-        
+
         if self.debug:
             logger.debug(f"User token HTTP status: {resp.status_code}")
-            
+
         if resp.status_code != 200:
             raise AuthenticationError(
-                f"获取用户令牌失败: {resp.text[:300]}", 
+                f"获取用户令牌失败: {resp.text[:300]}",
                 resp.status_code
             )
-            
+
         data = resp.json()
-        
+
         if self.debug:
             logger.debug(
                 f"User token response: {json.dumps(data, ensure_ascii=False)[:400]}"
             )
-            
+
         if data.get("code") != 0:
             raise AuthenticationError(
                 f"获取用户令牌失败: code={data.get('code')} msg={data.get('msg')}"
             )
-            
+
         return data["data"]["access_token"]
-    
-    @handle_api_errors    
+
+    @handle_api_errors
     def get_tenant_access_token(
-        self, 
+        self,
         retries: int = 3,
         base_delay: float = 0.8,
         force_refresh: bool = False
     ) -> str:
         """获取租户访问令牌
-        
+
         Args:
             retries: 重试次数
             base_delay: 基础重试延迟时间
             force_refresh: 是否强制刷新缓存的令牌
-            
+
         Returns:
             租户访问令牌
-            
+
         Raises:
             AuthenticationError: 获取令牌失败
             NetworkError: 网络请求失败
@@ -174,47 +184,47 @@ class FeishuClient:
         if not force_refresh and self._token_cache and self._token_expire:
             if now < self._token_expire:
                 return self._token_cache
-        
+
         payload = {
             "app_id": self.app_id,
             "app_secret": self.app_secret
         }
-        
+
         last_error: Optional[Exception] = None
-        
+
         for attempt in range(1, retries + 1):
             if self.debug:
                 logger.debug(f"Token request attempt {attempt}/{retries}")
-                
+
             try:
                 resp = requests.post(
                     FeishuConfig.TOKEN_ENDPOINT,
                     json=payload,
                     timeout=10
                 )
-                
+
                 if self.debug:
                     logger.debug(f"Token response status: {resp.status_code}")
-                
+
                 if resp.status_code == 500:
                     snippet = resp.text[:300]
                     logger.warning(f"Server 500 error. Response: {snippet}")
                     last_error = APIError("服务器内部错误", 500)
-                    
+
                 elif resp.status_code != 200:
                     last_error = APIError(
-                        f"获取令牌失败: {resp.text[:300]}", 
+                        f"获取令牌失败: {resp.text[:300]}",
                         resp.status_code
                     )
-                    
+
                 else:
                     data = resp.json()
-                    
+
                     if self.debug:
                         logger.debug(
                             f"Token response: {json.dumps(data, ensure_ascii=False)[:400]}"
                         )
-                    
+
                     if data.get("code") == 0:
                         token = data["tenant_access_token"]
                         # 缓存令牌 (有效期设为获取到的过期时间的80%)
@@ -222,74 +232,74 @@ class FeishuClient:
                         self._token_cache = token
                         self._token_expire = now + (expire_seconds * 0.8)
                         return token
-                    
+
                     last_error = APIError(
                         f"获取令牌失败: code={data.get('code')} msg={data.get('msg')}"
                     )
-                    
+
             except requests.RequestException as e:
                 last_error = NetworkError(f"网络请求失败: {e}")
                 if self.debug:
                     logger.debug(f"Network error: {e}")
-            
+
             # 指数退避重试
             if attempt < retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 if self.debug:
                     logger.debug(f"Retrying in {delay:.2f}s")
                 time.sleep(delay)
-                
+
         raise last_error or APIError("获取令牌失败(未知错误)")
-    
+
     @handle_api_errors
     def api_get(self, url: str, token: str) -> Dict:
         """通用飞书API GET请求方法
-        
+
         Args:
             url: 请求URL
             token: 访问令牌
-            
+
         Returns:
             响应数据
-            
+
         Raises:
             APIError: API调用失败
             NetworkError: 网络请求失败
             ResponseError: 响应解析失败
         """
         headers = {"Authorization": f"Bearer {token}"}
-        
+
         if self.debug:
             logger.debug(f"GET {url}")
-            
+
         resp = requests.get(url, headers=headers, timeout=(10, 30))
-        
+
         if self.debug:
             logger.debug(f"Response status: {resp.status_code}")
-            
+
         if resp.status_code != 200:
             raise APIError(
-                f"请求失败: {resp.text[:300]}", 
+                f"请求失败: {resp.text[:300]}",
                 resp.status_code
             )
-            
+
         data = resp.json()
-        
+
         if self.debug:
             logger.debug(
                 f"Response data: {json.dumps(data, ensure_ascii=False)[:400]}"
             )
-            
+
         if data.get("code") not in (0, None):
             raise APIError(
                 f"请求失败: code={data.get('code')} msg={data.get('msg')}"
             )
-            
+
         return data
-    
+
     @handle_api_errors
     def fetch_document_blocks(
-        self, 
+        self,
         doc_id: str,
         block_id: str,
         token: str,
@@ -297,17 +307,17 @@ class FeishuClient:
         max_depth: int = 8
     ) -> List[Dict]:
         """递归获取飞书文档块内容
-        
+
         Args:
             doc_id: 文档ID
             block_id: 当前块ID
             token: 访问令牌
             depth: 当前递归深度
             max_depth: 最大递归深度
-            
+
         Returns:
             文档块列表
-            
+
         Raises:
             APIError: API调用失败
             NetworkError: 网络请求失败
@@ -317,9 +327,9 @@ class FeishuClient:
         if depth > max_depth:
             logger.warning(f"达到最大递归深度 {max_depth}")
             return []
-            
+
         results: List[Dict] = []
-        
+
         # 构建API请求URL
         url = FeishuConfig.BLOCKS_ENDPOINT_TMPL.format(
             doc_id=doc_id,
@@ -327,22 +337,22 @@ class FeishuClient:
             page_size=200,
             page_token=""
         )
-        
+
         # 获取块数据
         data = self.api_get(url, token)
         block_data = data.get("data", {}).get("block")
-        
+
         if not block_data:
             return results
-            
+
         results.append(block_data)
-        
+
         # 处理子块
         children = block_data.get("children", [])
         for child_id in children:
             if not child_id:
                 continue
-                
+
             try:
                 child_blocks = self.fetch_document_blocks(
                     doc_id=doc_id,
@@ -354,26 +364,26 @@ class FeishuClient:
                 results.extend(child_blocks)
             except Exception as e:
                 logger.warning(f"获取子块 {child_id} 失败: {e}")
-                
+
         return results
-        
+
     def extract_block_text(self, block: Dict) -> str:
         """从文档块中提取文本内容
-        
+
         支持的块类型:
         - 1: 页面块（根块）
         - 2: 文本块
         - 其他: 通用处理
-        
+
         Args:
             block: 文档块数据
-            
+
         Returns:
             提取的文本内容
         """
         text_parts: List[str] = []
         block_type = block.get("block_type")
-        
+
         # 页面块处理
         if block_type == 1:
             text_parts.extend(
@@ -381,7 +391,7 @@ class FeishuClient:
                     block.get("page", {}).get("elements", [])
                 )
             )
-            
+
         # 文本块处理
         elif block_type == 2:
             text_parts.extend(
@@ -389,22 +399,22 @@ class FeishuClient:
                     block.get("text", {}).get("elements", [])
                 )
             )
-            
+
         # 其他块类型通用处理
         else:
             block_content = block.get("block") or {}
             text_parts.extend(
                 self._extract_nested_text(block_content)
             )
-            
+
         return " ".join(text_parts).strip()
-    
+
     def _extract_elements_text(self, elements: List[Dict]) -> List[str]:
         """从元素列表中提取文本
-        
+
         Args:
             elements: 元素列表
-            
+
         Returns:
             文本片段列表
         """
@@ -412,7 +422,7 @@ class FeishuClient:
         for elem in elements:
             if not isinstance(elem, dict):
                 continue
-                
+
             text_run = elem.get("text_run", {})
             content = text_run.get("content", "")
             if content:
@@ -420,18 +430,18 @@ class FeishuClient:
                     content.replace("\n", " ").strip()
                 )
         return texts
-        
+
     def _extract_nested_text(self, data: Dict) -> List[str]:
         """递归提取嵌套数据中的文本
-        
+
         Args:
             data: 嵌套的数据结构
-            
+
         Returns:
             文本片段列表
         """
         texts: List[str] = []
-        
+
         def _iter_dict(d: Dict) -> None:
             for key, value in d.items():
                 if key == "text_run" and isinstance(value, dict):
@@ -446,73 +456,186 @@ class FeishuClient:
                     for item in value:
                         if isinstance(item, dict):
                             _iter_dict(item)
-                            
+
         _iter_dict(data)
         return texts
-        
+
     def blocks_to_markdown(self, blocks: List[Dict]) -> str:
         """将飞书文档块转换为Markdown格式
-        
+
         Args:
             blocks: 文档块列表
-            
+
         Returns:
             Markdown格式的文档内容
         """
         lines: List[str] = []
-        
+
         for block in blocks:
             # 提取文本
             text = self.extract_block_text(block)
             if not text:
                 continue
-                
+
             # 根据块类型格式化
             block_type = str(block.get("block_type", "")).lower()
-            
+
             # 标题块处理
             if block_type.startswith("heading") or block_type == "3":
                 level = block_type[-1] if block_type[-1].isdigit() else "2"
                 lines.append(f"{'#' * int(level)} {text}")
-                
+
             # 列表块处理
             elif block_type in ("bullet", "ordered", "list", "4", "5", "6"):
                 lines.append(f"- {text}")
-                
+
             # 普通文本块
             else:
                 lines.append(text)
-                
+
         # 清理连续空行
         return self._clean_empty_lines(lines)
-        
+
     def _clean_empty_lines(self, lines: List[str]) -> str:
         """清理文本中的连续空行
-        
+
         Args:
             lines: 文本行列表
-            
+
         Returns:
             清理后的文本
         """
         cleaned: List[str] = []
         prev_blank = False
-        
+
         for line in lines:
             is_blank = not line.strip()
             if is_blank and prev_blank:
                 continue
             cleaned.append(line)
             prev_blank = is_blank
-            
+
         return "\n".join(cleaned)
-        
+
+    def fetch_sheet_as_markdown(self, sheets_url: str) -> str:
+        """Fetch a Feishu Sheets table and return it as a Markdown table.
+
+        This is intentionally a best-effort implementation for import flows.
+        It supports public/shared links that can be accessed via API with the
+        current app credentials.
+        """
+        # Extract spreadsheet token from URL like:
+        # https://mi.feishu.cn/sheets/<token>?sheet=<sheet_id>
+        m = re.search(r"/sheets/([A-Za-z0-9]+)", sheets_url)
+        if not m:
+            raise ValueError("无法从链接提取表格 token")
+        spreadsheet_token = m.group(1)
+
+        # Optional sheet ID from query
+        sheet_id = None
+        m_sheet = re.search(r"[?&]sheet=([A-Za-z0-9]+)", sheets_url)
+        if m_sheet:
+            sheet_id = m_sheet.group(1)
+
+        token = self.user_access_token or self.get_tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 1) Get sheet meta (to pick default sheet_id and/or title)
+        meta_url = f"{FeishuConfig.BASE_API}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/sheets/query"
+        resp = requests.get(meta_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            raise APIError(f"读取表格元信息失败: {resp.text[:300]}", resp.status_code)
+        meta = resp.json()
+        if meta.get("code") != 0:
+            raise APIError(f"读取表格元信息失败: code={meta.get('code')} msg={meta.get('msg')}")
+
+        sheets = (meta.get("data") or {}).get("sheets") or []
+        if not sheets:
+            raise APIError("读取表格元信息失败: sheets 为空")
+
+        if not sheet_id:
+            sheet_id = sheets[0].get("sheet_id")
+        if not sheet_id:
+            raise APIError("无法确定 sheet_id")
+
+        # 2) Read values from the whole sheet.
+        # Feishu API expects range in the path. Using `<sheet_id>` alone may 404.
+        values_range = f"{sheet_id}!A1:Z2000"
+        # 2) Read values.
+        # NOTE: In this tenant, the REST values endpoints may not be available even though
+        # sheets/query works. We provide a clear error and a reliable fallback path.
+        values_range = f"{sheet_id}!A1:Z2000"
+
+        # Try the commonly documented endpoints, but be prepared for 404.
+        tried: List[str] = []
+
+        def _try_get(url: str, **kwargs):
+            tried.append(url)
+            return requests.get(url, headers=headers, timeout=30, **kwargs)
+
+        resp = _try_get(
+            f"{FeishuConfig.BASE_API}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/values/{values_range}"
+        )
+        if resp.status_code == 404:
+            resp = _try_get(
+                f"{FeishuConfig.BASE_API}/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}/values_batch_get",
+                params={"ranges": values_range},
+            )
+
+        if resp.status_code == 404:
+            raise APIError(
+                "读取表格内容失败: 404 page not found。当前环境的 open-apis 可能未开通 Sheets Values 接口权限/能力。"
+                "可行替代方案：1) 在飞书表格中导出为 Excel 后上传；2) 复制表格内容粘贴；3) 联系管理员开通 Sheets 读取接口。"
+                f" (tried={tried})",
+                404,
+            )
+
+        if resp.status_code != 200:
+            raise APIError(f"读取表格内容失败: {resp.text[:300]}", resp.status_code)
+
+        data = resp.json()
+        if data.get("code") != 0:
+            raise APIError(f"读取表格内容失败: code={data.get('code')} msg={data.get('msg')}")
+
+        # Response shape differs by endpoint.
+        value_range = (data.get("data") or {}).get("valueRange")
+        if not value_range:
+            value_ranges = (data.get("data") or {}).get("valueRanges") or []
+            value_range = value_ranges[0] if value_ranges else {}
+
+        values = value_range.get("values") or []
+        if not values:
+            return ""
+
+        # Convert to markdown table using first row as header
+        header = [str(c).strip() for c in values[0]]
+        if not any(h for h in header):
+            # If header row is empty, synthesize columns
+            header = [f"列{i+1}" for i in range(len(values[0]))]
+
+        lines: List[str] = []
+        lines.append("| " + " | ".join(_escape_md_cell(h) for h in header) + " |")
+        lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+
+        for r in values[1:]:
+            row = list(r)
+            if len(row) < len(header):
+                row.extend([""] * (len(header) - len(row)))
+            elif len(row) > len(header):
+                row = row[:len(header)]
+            # Skip fully empty rows
+            if not any(str(c).strip() for c in row):
+                continue
+            lines.append("| " + " | ".join(_escape_md_cell(c) for c in row) + " |")
+
+        return "\n".join(lines)
+
     def fetch_document(self, url_or_id: str) -> str:
         """获取并处理飞书文档内容
-        
+
         Args:
             url_or_id: 文档URL或ID
-            
+
         Returns:
             Markdown格式的文档内容
         """
@@ -521,10 +644,10 @@ class FeishuClient:
             doc_id = self._extract_document_id(url_or_id)
             if not doc_id:
                 raise ValueError("无法从URL提取文档ID")
-                
-            # 获取访问令牌
-            token = self.get_tenant_access_token()
-                
+
+            # 获取访问令牌（优先用户态 token）
+            token = self.user_access_token or self.get_tenant_access_token()
+
             # 获取文档块
             blocks = self.fetch_document_blocks(
                 doc_id=doc_id,
@@ -533,44 +656,44 @@ class FeishuClient:
                 depth=0,
                 max_depth=6
             )
-                
+
             if self.debug:
                 logger.debug(f"获取到 {len(blocks)} 个文档块")
                 if blocks:
                     logger.debug(
                         f"第一个块示例: {json.dumps(blocks[0], ensure_ascii=False)[:200]}..."
                     )
-                
+
             # 转换为Markdown
             markdown = self.blocks_to_markdown(blocks)
-                
+
             if self.debug:
                 logger.debug(f"生成Markdown长度: {len(markdown)}")
                 logger.debug(f"Markdown预览: {markdown[:200]}...")
-                
+
             return markdown
-            
+
         except Exception as e:
             logger.exception("处理飞书文档失败")
             return f"【飞书API错误】{str(e)}"
-            
+
     def _extract_document_id(self, url_or_id: str) -> Optional[str]:
         """从URL或ID字符串中提取文档ID
-        
+
         Args:
             url_or_id: URL或ID字符串
-            
+
         Returns:
             文档ID，如果无法提取则返回None
         """
         doc_input = url_or_id.strip()
         match = re.search(r"/(?:docx|wiki|docs)/([A-Za-z0-9]+)", doc_input)
-        
+
         if match:
             return match.group(1)
-            
+
         # 如果不是URL格式，假定整个输入就是ID
         if re.match(r"^[A-Za-z0-9]+$", doc_input):
             return doc_input
-            
+
         return None

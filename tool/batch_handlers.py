@@ -151,10 +151,18 @@ def handle_batch_preview_and_generate(
                 with st.spinner("正在执行AI需求分析..."):
                     try:
                         # 创建AI处理器
+                        import uuid
                         ai_processor = AIRequirementProcessor(
-                            client=OpenAI(api_key=api_key, base_url=base_url),
+                            client=OpenAI(
+                                api_key=api_key,
+                                base_url=str(base_url or "").rstrip("/") + "/v1",
+                                default_headers={
+                                    "X-Model-Provider-Id": "xiaomi",
+                                    "X-Model-Request-Id": str(uuid.uuid4()),
+                                },
+                            ),
                             model=model,
-                            temperature=temperature
+                            temperature=temperature,
                         )
                         
                         # 获取需求文本列表
@@ -215,10 +223,18 @@ def handle_batch_preview_and_generate(
                 # 如果启用了AI分解，使用分解后的子需求
                 if enable_ai_decomposition and api_key:
                     try:
+                        import uuid
                         ai_processor = AIRequirementProcessor(
-                            client=OpenAI(api_key=api_key, base_url=base_url),
+                            client=OpenAI(
+                                api_key=api_key,
+                                base_url=str(base_url or "").rstrip("/") + "/v1",
+                                default_headers={
+                                    "X-Model-Provider-Id": "xiaomi",
+                                    "X-Model-Request-Id": str(uuid.uuid4()),
+                                },
+                            ),
                             model=model,
-                            temperature=temperature
+                            temperature=temperature,
                         )
                         
                         # 对复杂需求进行分解
@@ -448,9 +464,14 @@ def identify_requirements_with_ai(full_text: str, filename: str) -> List[str]:
         
         # 创建AI处理器
         from openai import OpenAI
+        import uuid
         client = OpenAI(
             api_key=st.session_state.get('api_key'),
-            base_url=st.session_state.get('base_url')
+            base_url=str(st.session_state.get('base_url') or "").rstrip("/") + "/v1",
+            default_headers={
+                "X-Model-Provider-Id": "xiaomi",
+                "X-Model-Request-Id": str(uuid.uuid4()),
+            },
         )
         
         # 构建提示词

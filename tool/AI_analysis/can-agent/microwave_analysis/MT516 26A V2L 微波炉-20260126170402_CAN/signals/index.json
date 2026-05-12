@@ -1,0 +1,36 @@
+{
+  "generated_at": "1970-01-01T00:00:00Z",
+  "total_signals": 3,
+  "signals": [
+    {
+      "signal": "OBCFltLvlIndcn",
+      "unit": "",
+      "can_ids": [
+        320
+      ],
+      "count": 2226,
+      "data_path": "signals/data/OBCFltLvlIndcn.json",
+      "anomaly_count": 4
+    },
+    {
+      "signal": "DCDCFltLvlIndcn",
+      "unit": "",
+      "can_ids": [
+        306
+      ],
+      "count": 2226,
+      "data_path": "signals/data/DCDCFltLvlIndcn.json",
+      "anomaly_count": 0
+    },
+    {
+      "signal": "CCUTCooltInlet",
+      "unit": "¡æ",
+      "can_ids": [
+        655
+      ],
+      "count": 445,
+      "data_path": "signals/data/CCUTCooltInlet.json",
+      "anomaly_count": 0
+    }
+  ]
+}

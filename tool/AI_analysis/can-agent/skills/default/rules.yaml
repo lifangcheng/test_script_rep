@@ -1,0 +1,72 @@
+- id: ccu_temp_warning
+  skill_name: "CCU温度预警"
+  # NOTE: file saved as UTF-8 to avoid mojibake
+  signal: "CCUTCooltInlet"
+  trigger:
+    signal: "CCUTCooltInlet"
+    condition: "> 60 or <= -40"  # 超出正常范围即触发
+  context_signals:
+    - "OBCModSts"
+    - "OBCFltFlg"
+
+- id: dcdc_fault_level_nonzero
+  skill_name: "DCDC故障等级非0"
+  signal: "DCDCFltLvlIndcn"
+  severity: high
+  trigger:
+    condition: "!= 0"
+
+- id: obc_fault_level_nonzero
+  skill_name: "OBC故障等级非0"
+  signal: "OBCFltLvlIndcn"
+  severity: high
+  trigger:
+    condition: "!= 0"
+
+# Added for rule-update eval: explicitly flags OBCFltLvlIndcn when value != 0
+# (kept separate from existing rules to make rule_trigger attribution unambiguous)
+- id: obc_fault_level_nonzero_eval2
+  skill_name: "OBC故障等级非0(Eval2新增)"
+  signal: "OBCFltLvlIndcn"
+  severity: high
+  trigger:
+    condition: "!= 0"
+
+# Legacy alias; kept for backward-compat (do not rely on for eval attribution)
+- id: obc_fault_level_nonzero_strict
+  skill_name: "OBC故障等级非0(严格)"
+  signal: "OBCFltLvlIndcn"
+  severity: high
+  trigger:
+    condition: "!= 0"
+
+# Alias rule kept for compatibility with older pipelines expecting explicit value field.
+- id: obc_fault_level_nonzero_value
+  skill_name: "OBC故障等级非0(值字段)"
+  signal: "OBCFltLvlIndcn"
+  severity: high
+  trigger:
+    value: "OBCFltLvlIndcn"
+    condition: "!= 0"
+
+- id: comm_quality_dcdc_faultlvl
+  skill_name: "通信质量异常-DCDCFltLvlIndcn"
+  signal: "DCDCFltLvlIndcn"
+  severity: medium
+  trigger:
+    # 方案A：仅用于标注/关联（非 rule_trigger）；对应 kind=period_deviation/missing/spike
+    note: "period_deviation/missing/spike"
+
+- id: comm_quality_obc_faultlvl
+  skill_name: "通信质量异常-OBCFltLvlIndcn"
+  signal: "OBCFltLvlIndcn"
+  severity: medium
+  trigger:
+    note: "period_deviation/missing/spike"
+
+- id: comm_quality_ccu_temp
+  skill_name: "通信质量异常-CCUTCooltInlet"
+  signal: "CCUTCooltInlet"
+  severity: medium
+  trigger:
+    note: "period_deviation/missing/spike"

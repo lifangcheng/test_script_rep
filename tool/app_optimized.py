@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class AppConfig:
     """应用程序配置"""
     # 基本参数
-    DEFAULT_HEADERS = ["测试名称", "需求编号", "需求描述", "测试描述", "前置条件", "测试步骤", "预期结果", "需求追溯"]
+    DEFAULT_HEADERS = ["测试名称", "需求编号", "需求描述", "测试描述", "前置条件", "测试步骤", "预期结果"]
     DEFAULT_BASE_URL = "http://model.mify.ai.srv"  # 内部服务优先
     MAX_RETRY_ATTEMPTS = 3
     MIN_PARAGRAPH_LENGTH = 10
@@ -40,22 +40,22 @@ class AppConfig:
         "Qwen2.5-VL-72B-Instruct-AWQ": "Qwen2.5-VL-72B-Instruct-AWQ",
         "mock-model": "mock-model",
     }
-    
+
     ALLOWED_MODELS = list(MODEL_MAP.keys())
-    
+
     MODEL_PRICING_TAG = {
         "MiMo-7B-RL": "(免费)",
-        "Qwen-235B-A22B": "(计费)", 
+        "Qwen-235B-A22B": "(计费)",
         "deepseek-v3.1": "(计费)",
         "Qwen2.5-VL-72B-Instruct-AWQ": "(计费)"
     }
-    
+
     # 服务路由配置
     MODEL_PROVIDER_HEADER = {
         "MiMo-7B-RL": "xiaomi",
-        "Qwen-235B-A22B": "openai_api_compatible",
-        "deepseek-v3.1": "openai_api_compatible",
-        "Qwen2.5-VL-72B-Instruct-AWQ": "openai_api_compatible"
+        "Qwen-235B-A22B": "xiaomi",
+        "deepseek-v3.1": "xiaomi",
+        "Qwen2.5-VL-72B-Instruct-AWQ": "xiaomi"
     }
 
 
@@ -64,15 +64,25 @@ def handle_errors(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
             logger.exception(e)
             msg = str(e)
+            if e.response is not None and e.response.status_code == 400:
+                # 详细显示 400 错误的内容
+                error_detail = e.response.text
+                st.error(f"请求被拒绝 (400 Bad Request)。\n服务器返回详情: {error_detail}")
+                return None
+
             low = msg.lower()
             # Detect common authentication failure patterns
             if '401' in msg or 'authentication' in low or 'invalid' in low and 'key' in low or 'invalid_request_error' in low:
                 st.error("认证失败：API Key 无效或未授权。请在侧边栏重新输入正确的 API Key，或选择 'local-model' / 'mock-model' 进行本地测试。")
             else:
                 st.error(f"操作失败: {msg}")
+            return None
+        except Exception as e:
+            logger.exception(e)
+            st.error(f"操作失败: {str(e)}")
             return None
     return wrapper
 
@@ -110,34 +120,79 @@ def build_prompt(requirement: str, headers: List[str], pos_n: int, neg_n: int, e
     background_section = ""
     if background_knowledge and background_knowledge.strip():
         background_section = f"""
-请参考以下背景知识来生成用例：
----
+# Context
+[可选背景知识]
+请参考以下检索到的上下文（如果为空，请根据通用行业标准处理）：
 {background_knowledge.strip()}
----
 """
 
     guidance = f"""
+# Role
+你是一位追求极致覆盖率的 OBC (On-Board Charger) / CCU (Combined Charging Unit) / BMU (电池管理)测试开发专家与自动化架构师。
+你深知自动化脚本编写的痛点：**一个测试函数只应验证一个特定的逻辑分支。**
+因此，在设计用例时，你遵循“原子化原则”——严禁将正向、逆向或边界测试混合在同一个用例中。
+你精通电力电子特性、ISO 15118/GB 27930 充电协议、CAN/CAN-FD 通信矩阵、UDS 诊断 (ISO 14229) 以及 HIL (Hardware-in-the-Loop) 测试系统。
+你的核心能力是将自然语言的需求描述转化为**包含具体信号交互、逻辑严密、可直接用于编写自动化脚本**的工程级测试用例。
+
 {background_section}
-你是一名具备电力电子与车载系统经验的高级测试工程师，熟悉 OBC/CCU/BMS/EVCC、CAN/CAN-FD、充电流程与功率约束。
-请基于下列需求生成 {total_cases} 条高质量、可执行的测试用例（CSV 格式，第一行为表头）：
+
+# Extraction Rules (关键步骤)
+在设计用例前，请先深入分析需求文档，提取以下要素（无需单独输出，但必须融入用例中）：
+1.  **信号实体**：识别需求中涉及的物理信号（如：AC_Voltage, CC_Resistor）和总线信号（如：CAN ID, 信号名, Enum值）。若文档未明确信号名，请使用符合行业规范的英文占位符（如 `OBC_Sts_ChgMode`）。
+2.  **逻辑阈值**：提取具体数值、公差（±5%）、时间参数（timeout=500ms, debounce=100ms）。
+3.  **状态机**：明确前置状态（如 Standby）和目标状态（如 Charging）。
+4. **Happy Path (正向)**：标称值输入，验证最理想的成功路径。
+5. **Boundary (边界)**：刚好达到触发阈值（如 >260V）、刚好未达到阈值（如 259V）。
+6. **Failure Mode (故障)**：注入错误信号、校验失败、物理连接断开。
+7. **Timeout (超时)**：前置条件满足但响应超时。
+
+# Task Instructions
+针对提供的“需求描述”，请遵循以下原则设计测试用例：
+
+1.  **信号级精确性**：
+    * 禁止使用模糊描述（如“检查电压是否正常”）。
+    * 必须使用**具体数值和信号逻辑**（如“检查 `OBC_DC_Out_Volt` 在 2s 内达到 400V ±5V”）。
+2.  **脚本可转换性 (Script-Ready)**：
+    * **测试步骤**必须是原子化的动作序列，格式建议为：`[动作] [对象/信号] 为 [数值/状态]`。
+    * **前置条件**必须量化（如 `KL15 = ON`, `BMS_SOC = 20%`）。
+3.  **覆盖率要求**：
+    * **正向场景**：标称值测试。
+    * **边界值**：最大值、最小值、最大值+1、最小值-1。
+    * **异常/注入**：信号丢失(Lost Communication)、校验错误(CRC Error)、超出范围值、超时未响应。
+    * **交互场景**：充电过程中发生诊断请求、高低温降额等。
+* 如果一条需求 `REQ-001` 包含“支持过压保护和欠压保护”，**必须**输出至少两条用例：一条测过压，一条测欠压。 * **禁止**在“预期结果”中出现“或者”、“如果不满足则...”这类分支逻辑。每条用例的结果必须是单一且确定的。
+*每一条需求，至少包含一条可验证的用例
+
+ 4. **交互/场景化用例 (Scenario Cases)**
+    * **核心优化点** **当发现需求间存在关联时，必须增加此类用例：** * **名称格式**：使用 `_Scenario_` 或 `_Interaction_` 后缀。
+    * **覆盖逻辑**： * **顺序执行**：将多个需求的逻辑串联成一个长流程（如：插枪 -> 握手成功 -> 充电 -> 满充停止 -> 拔枪）。
+    * **冲突仲裁**：在满足需求 A (正常工作) 时，强制触发需求 B (故障条件)，验证高优先级逻辑是否生效。
+    * **状态转换**：验证从需求 A 的状态跳转到需求 B 的状态是否符合时序要求。
+
+# Output Format
+请严格遵守 CSV 格式输出，**不要**使用 Markdown 表格，**不要**包含表头以外的解释性文字。
+字段顺序与要求如下：
+
+1.  **测试名称**：简练明确，包含场景特征（如：`CASE_OBC_Chg_OverVolt_Protection`），必须带后缀以区分场景 (e.g., `_Norm`, `_Max`, `_Timeout`)。
+2.  **需求编号**：同一需求编号会在多行中重复出现。 如果是交互用例，需列出所有相关的ID，用分号分隔 (e.g., `REQ-001;REQ-003`)。
+3.  **需求描述**：简要概括。
+4.  **测试描述**：测试目的（侧重于验证单一逻辑还是交互逻辑）。
+5.  **前置条件**：初始化环境变量与信号状态（用分号分隔）。
+6.  **测试步骤**：原子化步骤，**每一步带上序号**，包含具体的信号操作（Set/Wait/Check）。
+7.  **预期结果**：具体的信号响应、标志位翻转或物理现象，包含时间约束。
+8.  **用例类型**：`Positive`, `Negative`, `Boundary`, `Robustness`, `Integration`。
+
+# Input Requirement
+请根据以上规则，为以下需求生成 {total_cases} 条测试用例（正向 {pos_n}, 异常 {neg_n}, 边界 {edge_n}）：
+
+需求ID: {req_id if req_id else "REQ-001"}
+需求描述:
+{requirement.strip()}
+
+请开始生成测试用例（CSV格式）：
 {cols_line}
-
-分配：正向 {pos_n} 条，异常 {neg_n} 条，边界 {edge_n} 条。
-
-规则：
-- 仅输出 CSV 内容，不要附加解释或代码块。
-- 测试步骤用分号（；）分隔并放在同一单元格内。
-- 前置条件为空填写 "无"。
-- 输入数据要具体（例如：VIN=1234, CAN_ID=0x18FF50E5, 电压=400V, 电流=50A）。
-- 预期结果应包含可观测的阈值或时间条件（例如：电流稳定在 50A ±5% 持续 10s）。
-- 需求编号列填写: {req_id if req_id else "REQ-001"}
-- 需求描述列简要概括需求内容（不超过50字）
-- 需求追溯列填写该测试用例验证的具体需求点
-
-电力电子注意事项：明确采样时序、SOC/温度/电力边界、故障注入（丢帧/延迟/短路）、EVCC通信协议和安全互锁。
 """
-
-    return f"{guidance}\n\n需求ID: {req_id}\n需求描述:\n{requirement.strip()}\n\n请开始生成测试用例："
+    return guidance
 
 
 def get_requirement_templates() -> Dict[str, str]:
@@ -187,7 +242,7 @@ def compute_dynamic_case_counts(
     sentences = len(re.split(r'[。！？.!?]+', text.strip()))
     words = len(text.strip())
     base_score = min(1.0, words / 1000) * 0.6 + min(1.0, sentences / 10) * 0.4
-    
+
     # 风险关键词加权 (每个关键词提高10%的复杂度, 最高到2.0)
     risk_keywords = [
         "异常", "故障", "错误", "超时", "重试", "保护", "边界",
@@ -195,28 +250,28 @@ def compute_dynamic_case_counts(
     ]
     keyword_matches = sum(1 for k in risk_keywords if k in text)
     risk_score = min(2.0, 1.0 + keyword_matches * 0.1)
-    
+
     # 最终复杂度分数 (基础分数和风险分数的加权平均)
     complexity = base_score * 0.7 + risk_score * 0.3
-    
+
     # 根据复杂度计算用例总数 (在min_total和max_total之间线性插值)
     total_cases = round(min_total + (max_total - min_total) * complexity)
-    
+
     # 按权重分配用例数
     total_weight = pos_w + neg_w + edge_w
     pos_ratio = pos_w / total_weight
     neg_ratio = neg_w / total_weight
     edge_ratio = edge_w / total_weight
-    
+
     pos = round(total_cases * pos_ratio)
     neg = round(total_cases * neg_ratio)
     edge = round(total_cases * edge_ratio)
-    
+
     # 确保每类至少1个用例
     pos = max(1, pos)
     neg = max(1, neg)
     edge = max(1, edge)
-    
+
     return pos, neg, edge
 
 def _generate_mock_csv(requirement: str, headers: List[str], pos_n: int, neg_n: int, edge_n: int, req_id: str = "") -> str:
@@ -265,7 +320,7 @@ def _generate_mock_csv(requirement: str, headers: List[str], pos_n: int, neg_n: 
 
 
 @handle_errors
-def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature: float = 0.2, local_model_url: Optional[str] = None, http_proxy: Optional[str] = None, https_proxy: Optional[str] = None) -> str:
+def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature: float = 0.2, local_model_url: Optional[str] = None, http_proxy: Optional[str] = None, https_proxy: Optional[str] = None, timeout: int = 60) -> str:
     """
     Calls the specified model via HTTP POST request.
     This function handles remote (OpenAI-like & Gemini) and local models.
@@ -273,10 +328,10 @@ def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature
     # Validate inputs
     if not model:
         raise ValueError("必须指定模型名称")
-        
+
     if model not in AppConfig.MODEL_MAP and model not in ["local-model", "mock-model", "gemini"]:
         raise ValueError(f"不支持的模型: {model}")
-        
+
     proxies = {}
     if http_proxy and http_proxy.strip():
         proxies["http"] = http_proxy.strip()
@@ -300,7 +355,7 @@ def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature
 
         for attempt in range(MAX_RETRY_ATTEMPTS):
             try:
-                r = requests.post(url, headers=headers, json=payload, timeout=60, proxies=proxies if proxies else None)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout, proxies=proxies if proxies else None)
                 r.raise_for_status()
                 j = r.json()
                 return j['candidates'][0]['content']['parts'][0]['text']
@@ -349,13 +404,14 @@ def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature
             "Connection": "keep-alive"
         }
 
-        # 从AppConfig获取路由头
+        # 从AppConfig获取路由头（Mify 网关使用 X-Model-Provider-Id；避免使用 X-Provider 造成路由不一致）
         provider = AppConfig.MODEL_PROVIDER_HEADER.get(model)
-        if provider:
-            headers["X-Provider"] = provider
+        # 兼容旧配置：若 MODEL_PROVIDER_HEADER 仍返回 openai_api_compatible，则映射到 xiaomi
+        if provider == "openai_api_compatible":
+            provider = "xiaomi"
 
         actual_model = AppConfig.MODEL_MAP.get(model, model)
-        
+
         # Add debug logging
         logger.info(f"Calling API endpoint: {url}")
         logger.info(f"Model: {model} (actual: {actual_model})")
@@ -378,17 +434,16 @@ def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature
             "model": actual_model,
             "messages": [{"role": "system", "content": "你是测试用例生成助手，严格输出 CSV"}, {"role": "user", "content": prompt}],
             "temperature": temperature,
-            "max_tokens": 4000,
         }
         # 从MODEL_PROVIDER_HEADER获取路由头
-        provider = AppConfig.MODEL_PROVIDER_HEADER.get(model)
         if provider:
-            headers["X-Provider"] = provider
+            headers["X-Model-Provider-Id"] = provider
+            headers.setdefault("X-Model-Request-Id", str(uuid.uuid4()))
 
     # Make the request with retries for non-Gemini models
     for attempt in range(AppConfig.MAX_RETRY_ATTEMPTS):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=60, proxies=proxies if proxies else None)
+            r = requests.post(url, headers=headers, json=payload, timeout=120, proxies=proxies if proxies else None)
             r.raise_for_status()
             j = r.json()
             if model == "local-model":
@@ -407,6 +462,14 @@ def call_model(model: str, prompt: str, api_key: str, base_url: str, temperature
                 else:
                     st.error("API 速率限制过于频繁，请稍后再试或检查您的账户配额。")
                     raise e # Raise on the last attempt
+            elif e.response.status_code == 400:
+                logger.error(f"400 Bad Request. URL: {url}")
+                logger.error(f"Payload: {json.dumps(payload, ensure_ascii=False)}")
+                logger.error(f"Response: {e.response.text}")
+                if st.session_state.get("debug_mode"):
+                    st.error(f"400 Bad Request. Response: {e.response.text}")
+                    st.json(payload)
+                raise e
             # For other HTTP errors, re-raise immediately
             raise e
         except (requests.exceptions.RequestException, KeyError, IndexError) as e:
@@ -807,7 +870,7 @@ def main():
 def make_client(api_key: str, base_url: str, http_proxy: Optional[str] = None, https_proxy: Optional[str] = None) -> Any:
     if OpenAI is None:
         raise ImportError("OpenAI package not installed. Please install it with: pip install openai")
-    
+
     proxies = {}
     if http_proxy:
         proxies["http"] = http_proxy
@@ -815,10 +878,20 @@ def make_client(api_key: str, base_url: str, http_proxy: Optional[str] = None, h
         proxies["https"] = https_proxy
     elif http_proxy:  # Fallback for https if only http is provided
         proxies["https"] = http_proxy
-        
+
+    import uuid
+
+    base = base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+
     return OpenAI(
         api_key=api_key,
-        base_url=base_url.rstrip("/"),
+        base_url=base,
+        default_headers={
+            "X-Model-Provider-Id": "xiaomi",
+            "X-Model-Request-Id": str(uuid.uuid4()),
+        },
         http_client=requests.Session(),
         timeout=60.0,
         max_retries=3,
@@ -883,9 +956,9 @@ def get_standard_prompt_template() -> str:
 
 def process_single_requirement(
     req_text: str = "",
-    req_id: str = "", 
+    req_id: str = "",
     base_url: str = "",
-    model: str = "", 
+    model: str = "",
     temperature: float = 0.2,
     headers: List[str] = None,
     pos_n: int = 2,
@@ -903,7 +976,7 @@ def process_single_requirement(
     if not req_text.strip():
         st.warning("请输入需求描述")
         return
-        
+
     try:
         if auto_mode:
             local_pos, local_neg, local_edge = compute_dynamic_case_counts(
@@ -919,26 +992,26 @@ def process_single_requirement(
             local_pos, local_neg, local_edge = pos_n, neg_n, edge_n
 
         prompt = build_prompt(
-            req_text, 
-            headers, 
+            req_text,
+            headers,
             local_pos,
-            local_neg, 
+            local_neg,
             local_edge,
             req_id,
             background_knowledge
         )
 
         text = call_model(
-            model=model, 
-            prompt=prompt, 
-            api_key=api_key, 
-            base_url=base_url, 
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            base_url=base_url,
             temperature=temperature,
             local_model_url=local_model_url,
             http_proxy=http_proxy,
             https_proxy=https_proxy
         )
-        
+
         if text:
             df = parse_csv_to_df(text, headers)
             if df is None or df.empty:
